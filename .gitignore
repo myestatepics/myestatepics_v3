@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.pyo
+
+# macOS
+.DS_Store
+
+# Generated outputs
+output/
+
+# Test images
+input/
+
+# Local backups
+_backup_*/
+
+# IDE
+.vscode/
+.idea/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+*.log

@@ -1,0 +1,55 @@
+{
+  "input_folder": "input",
+  "output_folder": "output",
+  "max_side": 2048,
+  "overlay_quality": 90,
+  "model_id": "nvidia/segformer-b4-finetuned-ade-512-512",
+  "use_mask_cache": true,
+  "maximum_output_mb": 2.0,
+  "jpeg_quality": 95,
+  "targets": {
+    "wall_light_threshold": 0.45,
+    "wall_medium_threshold": 0.28,
+    "wall_light_target": 0.62,
+    "wall_medium_max_lift": 0.16,
+    "wall_dark_lift": 0.12,
+    "wall_dark_max_lift": 0.14,
+    "floor_light_threshold": 0.45,
+    "floor_medium_threshold": 0.3,
+    "floor_light_lift": 0.04,
+    "floor_medium_lift": 0.12,
+    "floor_medium_target_cap": 0.52,
+    "floor_dark_lift": 0.1,
+    "floor_dark_max_lift": 0.12,
+    "ceiling_neutral_l_threshold": 0.55,
+    "ceiling_neutral_chroma_threshold": 14.0,
+    "ceiling_target": 0.8,
+    "ceiling_nonneutral_lift": 0.12,
+    "ceiling_nonneutral_max_lift": 0.15,
+    "door_light_target": 0.68,
+    "door_dark_lift": 0.1,
+    "furnishing_factor": 0.08,
+    "protected_chroma_restore_strength": 0.22,
+    "wb_high_limits": [
+      0.75,
+      1.32
+    ],
+    "wb_low_limits": [
+      0.82,
+      1.22
+    ]
+  },
+  "workflow": {
+    "create_scored_comparisons": true,
+    "create_batch_contact_sheet": true,
+    "conservative_final_routing": true,
+    "minimum_final_score": 80
+  },
+  "version": "3.0-phase3-test",
+  "phase3": {
+    "floor_direct_target_enabled": false,
+    "material_inherit_factor": 0.08,
+    "edge_aware_propagation": true,
+    "window_recovery_adaptive": true
+  }
+}
