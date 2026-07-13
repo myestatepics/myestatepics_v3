@@ -225,6 +225,20 @@ def _damp_chroma_growth(
     return np.where(needs, converted, lifted)
 
 
+
+def _lock_lab_chroma(original: np.ndarray, lifted: np.ndarray) -> np.ndarray:
+    """Preserve photographed Lab chroma while accepting lifted luminance.
+
+    GLOBAL_SAFE has no reliable semantic material masks. Reusing the lifted
+    L channel with the original a/b channels prevents exposure from warming
+    floors, cabinets, walls, or ceilings. Geometry is unchanged.
+    """
+    src = cv2.cvtColor(original, cv2.COLOR_RGB2LAB).astype(np.float32)
+    dst = cv2.cvtColor(lifted, cv2.COLOR_RGB2LAB).astype(np.float32)
+    dst[..., 1] = src[..., 1]
+    dst[..., 2] = src[..., 2]
+    return cv2.cvtColor(np.clip(dst, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
 def adaptive_per_class_exposure(
     rgb: np.ndarray,
     scene: Scene,
@@ -469,11 +483,15 @@ def global_safe_exposure(
     shadow_pixels = 1.0 - _smoothstep(0.14, 0.58, y)
     mid_pixels = np.clip(1.0 - np.abs(y - 0.46) / 0.38, 0.0, 1.0)
 
-    black_anchor = _smoothstep(0.035, 0.16, y)
-    highlight_guard = 1.0 - _smoothstep(0.76, 0.96, y)
+    # Preserve true blacks while allowing dark wood/floors and dim painted
+    # surfaces to receive useful MLS lift. The old 0.16 shoulder starved
+    # legitimate dark materials; this tighter anchor still holds pixels near
+    # black while releasing usable shadow detail sooner.
+    black_anchor = _smoothstep(0.020, 0.120, y)
+    highlight_guard = 1.0 - _smoothstep(0.78, 0.96, y)
 
-    shadow_lift = float(analysis["shadow_lift"]) * 0.78
-    midtone_lift = float(analysis["midtone_lift"]) * 0.72
+    shadow_lift = float(analysis["shadow_lift"]) * 0.92
+    midtone_lift = float(analysis["midtone_lift"]) * 0.86
 
     linear_lift = (
         shadow_lift * (0.58 * shadow_pixels + 0.42 * dark_region)
@@ -482,13 +500,13 @@ def global_safe_exposure(
 
     profile = str(analysis.get("room_profile", "generic"))
     first_pass_cap = {
-        "dark_room": 1.65,
-        "low_light": 2.20,
-        "bathroom": 1.85,
-        "kitchen": 1.80,
-        "living": 1.85,
-        "bedroom": 1.80,
-        "generic": 1.80,
+        "dark_room": 1.85,
+        "low_light": 2.30,
+        "bathroom": 1.90,
+        "kitchen": 1.95,
+        "living": 1.95,
+        "bedroom": 1.90,
+        "generic": 1.95,
     }.get(profile, 1.80)
 
     log_gain = np.log(
@@ -502,13 +520,13 @@ def global_safe_exposure(
     y_first = _luminance(first)
 
     target = {
-        "dark_room": 0.46,
-        "low_light": 0.50,
-        "bathroom": 0.53,
-        "kitchen": 0.52,
-        "living": 0.51,
-        "bedroom": 0.50,
-        "generic": 0.50,
+        "dark_room": 0.50,
+        "low_light": 0.54,
+        "bathroom": 0.55,
+        "kitchen": 0.56,
+        "living": 0.55,
+        "bedroom": 0.54,
+        "generic": 0.55,
     }.get(profile, 0.50)
 
     h = y.shape[0]
@@ -518,17 +536,21 @@ def global_safe_exposure(
         spatial = np.zeros_like(y, dtype=bool)
         spatial[: max(1, int(h * 0.58)), :] = True
         reference = spatial & (y > 0.13) & (y < 0.82)
-        convergence_cap = 1.30
+        convergence_cap = 1.50
     else:
-        reference = (y > 0.11) & (y < 0.82)
-        convergence_cap = 1.35
+        reference = (y > 0.10) & (y < 0.84)
+        convergence_cap = 1.45
 
     correction_gain, convergence_log = _convergence_log_gain(
         y, y_first, target, reference, max_ratio=convergence_cap
     )
     total_gain = log_gain + correction_gain
     out = _apply_log_gain(rgb, total_gain)
-    out = _damp_chroma_growth(rgb, out, total_gain, y)
+    # GLOBAL_SAFE has no semantic material masks. Treat the whole image as
+    # color-protected during exposure so added light cannot make hardwood,
+    # cabinets, or painted surfaces run warmer/more saturated. This does not
+    # alter the incoming WB; it only prevents exposure from amplifying chroma.
+    out = _lock_lab_chroma(rgb, out)
 
     return out, {
         "route": "GLOBAL_SAFE",
