@@ -1,12 +1,10 @@
+
 from __future__ import annotations
 
 import cv2
 import numpy as np
 
 from .scene import Scene
-
-
-_EPS = 1e-4
 
 
 def _smoothstep(a: float, b: float, x: np.ndarray) -> np.ndarray:
@@ -16,185 +14,81 @@ def _smoothstep(a: float, b: float, x: np.ndarray) -> np.ndarray:
 
 def _luminance(rgb: np.ndarray) -> np.ndarray:
     f = rgb.astype(np.float32) / 255.0
-    return (
-        0.2126 * f[..., 0]
-        + 0.7152 * f[..., 1]
-        + 0.0722 * f[..., 2]
-    ).astype(np.float32)
+    return 0.2126 * f[..., 0] + 0.7152 * f[..., 1] + 0.0722 * f[..., 2]
 
 
-def _guided_smooth(
-    guide_rgb: np.ndarray,
-    field: np.ndarray,
+def _edge_aware_smooth(
+    rgb: np.ndarray,
+    gain_map: np.ndarray,
     radius: int,
-    eps: float = 1e-3,
+    max_gain: float = 2.5,
 ) -> tuple[np.ndarray, str]:
-    guide = _luminance(guide_rgb)
+    guide = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
 
     if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
         smoothed = cv2.ximgproc.guidedFilter(
             guide=guide,
-            src=field.astype(np.float32),
+            src=gain_map.astype(np.float32),
             radius=max(8, int(radius)),
-            eps=float(eps),
+            eps=1e-3,
         )
-        return smoothed.astype(np.float32), "guided_filter"
+        return np.clip(smoothed, 0.0, max_gain), "guided_filter"
 
-    # Safe fallback when opencv-contrib is unavailable.
     smoothed = cv2.bilateralFilter(
-        field.astype(np.float32),
+        gain_map.astype(np.float32),
         d=9,
         sigmaColor=0.08,
         sigmaSpace=max(16, int(radius)),
     )
-    return smoothed.astype(np.float32), "bilateral_fallback"
+    return np.clip(smoothed, 0.0, max_gain), "bilateral_fallback"
 
 
-def _component_constant_log_gain(
-    luminance: np.ndarray,
+def _apply_log_gain(rgb: np.ndarray, log_gain: np.ndarray) -> np.ndarray:
+    """
+    v3.2 Fix 2 (Phase 3 Q4/Q5, implemented for real):
+    exposure is a multiplicative gain on luminance, applied as a per-pixel
+    ratio to RGB. R:G:B ratios are untouched by construction, so material
+    color (wood hue, saturation, grain relationships) is preserved with no
+    chroma-compensation hack. Reflectance detail is preserved because every
+    pixel in a region is scaled by the same smooth illumination gain.
+    """
+    f = rgb.astype(np.float32) / 255.0
+    ratio = np.exp(log_gain.astype(np.float32))[..., None]
+    out = f * ratio
+    # Soft highlight shoulder: compress only what would clip, per pixel,
+    # preserving ratios by scaling the whole pixel.
+    peak = out.max(axis=2, keepdims=True)
+    over = peak > 1.0
+    if np.any(over):
+        scale = np.where(over, 1.0 / np.maximum(peak, 1e-6), 1.0)
+        out = out * scale
+    return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def _component_log_gain(
+    y: np.ndarray,
     mask: np.ndarray,
-    target_map: np.ndarray,
-    min_component_fraction: float,
-    max_gain: float,
-) -> tuple[np.ndarray, list[dict]]:
+    target: float,
+    max_linear_lift: float,
+) -> tuple[np.ndarray, float, float]:
     """
-    Build a component-wise constant log-gain field.
-
-    This is intentionally NOT a per-pixel target-minus-current calculation.
-    Every large connected material component receives one robust gain estimate,
-    which prevents bright patches inside uniformly painted dark walls.
+    v3.2 Fix 3: constant lift per component computed from the component
+    MEDIAN (spec behavior), never per-pixel push toward the target
+    (which is a tone compressor that irons out natural wall shading).
+    Returned as a log-luminance gain painted uniformly over the mask.
     """
-    h, w = luminance.shape
-    area = h * w
-    binary = (mask > 0.5).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
-
-    field = np.zeros_like(luminance, dtype=np.float32)
-    logs: list[dict] = []
-
-    for component_id in range(1, count):
-        component_area = int(stats[component_id, cv2.CC_STAT_AREA])
-        if component_area < max(64, int(area * min_component_fraction)):
-            continue
-
-        component = labels == component_id
-        median_l = float(np.median(luminance[component]))
-        median_target = float(np.median(target_map[component]))
-
-        if median_target <= median_l + 1e-4:
-            gain = 1.0
-        else:
-            gain = float(
-                np.clip(
-                    median_target / max(median_l, 0.03),
-                    1.0,
-                    max_gain,
-                )
-            )
-
-        log_gain = float(np.log(gain))
-        field[component] = log_gain
-
-        logs.append({
-            "component": int(component_id),
-            "area_percent": float(component_area / area * 100.0),
-            "median_before": median_l,
-            "median_target": median_target,
-            "gain": gain,
-            "log_gain": log_gain,
-        })
-
-    return field, logs
-
-
-def _estimate_log_illumination(
-    rgb: np.ndarray,
-    luminance: np.ndarray,
-    radius: int,
-) -> tuple[np.ndarray, np.ndarray, str]:
-    """
-    Phase 3 Q4 intrinsic decomposition.
-
-    log(Y) = illumination + reflectance
-
-    The illumination layer is an edge-aware, low-frequency estimate.
-    Reflectance contains material identity: grain, texture, paint variation,
-    and local contrast. Exposure changes are applied to illumination only.
-    """
-    log_y = np.log(np.clip(luminance, _EPS, 1.0)).astype(np.float32)
-
-    illumination, mode = _guided_smooth(
-        guide_rgb=rgb,
-        field=log_y,
-        radius=max(24, int(radius)),
-        eps=2.5e-3,
-    )
-    illumination = illumination.astype(np.float32)
-    reflectance = (log_y - illumination).astype(np.float32)
-
-    return illumination, reflectance, mode
-
-
-def _apply_illumination_gain(
-    rgb: np.ndarray,
-    illumination: np.ndarray,
-    reflectance: np.ndarray,
-    log_gain: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Phase 3 Q5 multiplicative recombination.
-
-    Reconstruct:
-        Y' = exp(illumination + log_gain + reflectance)
-
-    Then apply the scalar ratio Y'/Y to RGB. The same scalar is applied to
-    every channel, preserving material RGB ratios and therefore hue.
-    """
-    original_y = np.exp(illumination + reflectance).astype(np.float32)
-    corrected_y = np.exp(
-        illumination + log_gain.astype(np.float32) + reflectance
-    ).astype(np.float32)
-
-    scalar = corrected_y / np.maximum(original_y, _EPS)
-    scalar = np.clip(scalar, 0.25, 4.0).astype(np.float32)
-
-    rgb_f = rgb.astype(np.float32) / 255.0
-    corrected = rgb_f * scalar[..., None]
-
-    # Soft clipping guard: preserve ratios until a channel would exceed 1.0,
-    # then scale the entire pixel uniformly rather than clipping channels
-    # independently.
-    peak = np.max(corrected, axis=2, keepdims=True)
-    corrected = np.where(
-        peak > 1.0,
-        corrected / np.maximum(peak, 1.0),
-        corrected,
-    )
-
-    out = np.clip(corrected * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    return out, corrected_y
-
-
-def _apply_multiplicative_gain(
-    rgb: np.ndarray,
-    log_gain: np.ndarray,
-) -> np.ndarray:
-    """
-    Compatibility wrapper used by the global-safe route and older tests.
-
-    It now uses the same ratio-preserving RGB recombination as the semantic
-    Phase 3 path.
-    """
-    y = _luminance(rgb)
-    illumination = np.log(np.clip(y, _EPS, 1.0)).astype(np.float32)
-    reflectance = np.zeros_like(illumination, dtype=np.float32)
-    out, _ = _apply_illumination_gain(
-        rgb=rgb,
-        illumination=illumination,
-        reflectance=reflectance,
-        log_gain=log_gain,
-    )
-    return out
+    sel = mask > 0.5
+    if not np.any(sel):
+        return np.zeros_like(y, dtype=np.float32), 0.0, 0.0
+    median = float(np.median(y[sel]))
+    if median <= 1e-4:
+        return np.zeros_like(y, dtype=np.float32), median, 0.0
+    desired = min(max(target, median), median + max_linear_lift)
+    log_gain_value = float(np.log(max(desired, 1e-4) / median))
+    log_gain_value = max(0.0, log_gain_value)
+    gain = np.zeros_like(y, dtype=np.float32)
+    gain[sel] = log_gain_value
+    return gain, median, log_gain_value
 
 
 def adaptive_per_class_exposure(
@@ -204,231 +98,160 @@ def adaptive_per_class_exposure(
     analysis: dict,
 ) -> tuple[np.ndarray, dict]:
     """
-    Phase 3 Fix 2: intrinsic log-luminance illumination correction.
-
-    Design rule:
-        Correct the light, never the materials.
-
-    Changes from the previous engine:
-    - No additive LAB exposure lift.
-    - No chroma compensation boost.
-    - Wall components receive uniform multiplicative illumination gain.
-    - Ceiling receives multiplicative illumination gain.
-    - Floors/cabinets/furniture/rugs receive inherited room light only.
-    - Hard protected masks prevent Gaussian/guided-field leakage into materials.
+    Phase 3 rules (v3.2 -- fully implemented):
+    - Walls, ceilings and doors drive room brightness (illumination classes).
+    - Materials (floor, cabinets, furniture, rugs...) have no targets and
+      inherit the FULL room illumination field (Fix 4). The field itself is
+      the natural amount of light they should receive.
+    - Lifts are per-component constants from medians (Fix 3), propagated
+      edge-aware so light stops at material and paint boundaries.
+    - Correction is multiplicative in luminance (Fix 2): "correct the light,
+      never the materials."
     """
     y = _luminance(rgb)
     h, w = y.shape
-    max_side = max(h, w)
+    structure_gain = np.zeros_like(y, dtype=np.float32)
+    per_class: dict[str, dict] = {}
 
-    decomposition_radius = max(32, round(max_side / 32))
-    illumination, reflectance, decomposition_mode = _estimate_log_illumination(
-        rgb=rgb,
-        luminance=y,
-        radius=decomposition_radius,
+    # WALLS: per-component classification from tone_classify. The target map
+    # is constant within each component, so median-based gain per component
+    # is recovered by grouping on the map values within the wall mask.
+    wall_mask = scene.masks["wall"]
+    wall_target_map = tones["wall_target_map"]
+    wall_sel = wall_mask > 0.5
+    wall_median = float(np.median(y[wall_sel])) if np.any(wall_sel) else None
+    wall_gains = []
+    if np.any(wall_sel):
+        for target_value in np.unique(wall_target_map[wall_sel]):
+            if target_value <= 0:
+                continue
+            comp_mask = (np.abs(wall_target_map - target_value) < 1e-4) & wall_sel
+            gain, comp_median, gval = _component_log_gain(
+                y, comp_mask.astype(np.float32), float(target_value), 0.35
+            )
+            structure_gain = np.maximum(structure_gain, gain)
+            wall_gains.append({
+                "target": float(target_value),
+                "median": comp_median,
+                "log_gain": gval,
+            })
+    per_class["wall"] = {"median_before": wall_median, "components": wall_gains}
+
+    # CEILING
+    ceiling_mask = scene.masks["ceiling"]
+    ceiling_target = float(tones["ceiling"]["target"])
+    ceiling_gain, ceiling_median, ceiling_gval = _component_log_gain(
+        y, ceiling_mask, ceiling_target, 0.40
     )
+    structure_gain = np.maximum(structure_gain, ceiling_gain)
+    per_class["ceiling"] = {
+        "median_before": ceiling_median if np.any(ceiling_mask > 0.5) else None,
+        "target": ceiling_target,
+        "log_gain": ceiling_gval,
+    }
 
-    wall_soft = np.clip(scene.masks["wall"], 0.0, 1.0)
-    ceiling_soft = np.clip(scene.masks["ceiling"], 0.0, 1.0)
-    door_soft = np.clip(scene.masks["door"], 0.0, 1.0)
-    floor_soft = np.clip(scene.masks["floor"], 0.0, 1.0)
-    protected_soft = np.clip(scene.masks["protected"], 0.0, 1.0)
+    # DOOR: small direct lift only.
+    door_mask = scene.masks["door"]
+    door_target = float(tones["door"]["target"])
+    door_gain, door_median, door_gval = _component_log_gain(
+        y, door_mask, door_target, 0.10
+    )
+    structure_gain = np.maximum(structure_gain, door_gain)
+    per_class["door"] = {
+        "median_before": door_median if np.any(door_mask > 0.5) else None,
+        "target": door_target,
+        "log_gain": door_gval,
+    }
 
-    # A hard material lock is required. Feathered masks alone allowed exposure
-    # leakage and caused the historic z-17 floor shift.
-    floor_hard = (floor_soft > 0.20).astype(np.float32)
-    protected_hard = (protected_soft > 0.20).astype(np.float32)
-    material_lock = np.maximum(floor_hard, protected_hard)
+    # FLOOR: protected -- no direct target (Phase 3 Q2).
+    floor_mask = scene.masks["floor"]
+    per_class["floor"] = {
+        "mode": "protected_no_direct_target",
+        "median_before": (
+            float(np.median(y[floor_mask > 0.5]))
+            if np.any(floor_mask > 0.5)
+            else None
+        ),
+        "direct_lift": 0.0,
+    }
+
+    # Edge-aware propagation: light stops at boundaries.
+    radius = max(16, round(max(h, w) / 110))
+    smoothed_structure, propagation_mode = _edge_aware_smooth(rgb, structure_gain, radius)
+
+    # Broad ambient illumination field for materials. Deliberately DIFFUSE
+    # (large Gaussian), not edge-aware: ambient room light crosses material
+    # boundaries by nature. Edge-awareness is applied to the STRUCTURE gain
+    # above (so lifts stop at paint/material edges); the ambient field is the
+    # smooth average of that corrected light, delivered to materials.
+    field_sigma = max(24.0, max(h, w) / 12.0)
+    local_field = cv2.GaussianBlur(smoothed_structure, (0, 0), field_sigma)
+    # Room-level ambient term: image-space distance is the wrong model for
+    # ambient light -- a floor three metres from a wall still receives the
+    # room's light. The scalar is the mean illumination correction over the
+    # structure surfaces; bright rooms (near-zero gains) contribute ~0, so
+    # already-good photos stay untouched.
+    structure_sel = scene.masks["structure"] > 0.5
+    ambient_scalar = (
+        float(np.mean(smoothed_structure[structure_sel]))
+        if np.any(structure_sel)
+        else 0.0
+    )
+    illumination_field = np.maximum(local_field, ambient_scalar)
+    field_mode = f"gaussian_sigma_{field_sigma:.0f}_plus_ambient_{ambient_scalar:.3f}"
+
+    protected = scene.masks["protected"]
+    floor = scene.masks["floor"]
+    protected_all = np.clip(np.maximum(protected, floor), 0.0, 1.0)
+
+    # v3.2 Fix 4: materials inherit the FULL illumination field. The field is
+    # already the correct ambient quantity; attenuating it (the old 8%) starves
+    # 30-50% of the frame of light and is the root of chronic underexposure.
+    material_inherit_factor = float(analysis.get("material_inherit_factor", 1.0))
+    inherited_material_gain = material_inherit_factor * illumination_field * protected_all
+
+    final_gain = np.maximum(
+        smoothed_structure * (1.0 - protected_all),
+        inherited_material_gain,
+    )
 
     exclusion = np.maximum.reduce([
-        np.clip(scene.masks["window"], 0.0, 1.0),
-        np.clip(scene.masks["curtain"], 0.0, 1.0),
-        np.clip(scene.masks["mirror"], 0.0, 1.0),
+        scene.masks["window"],
+        scene.masks["curtain"],
+        scene.masks["mirror"],
     ])
-    exclusion_hard = (exclusion > 0.15).astype(np.float32)
+    final_gain *= 1.0 - np.clip(exclusion, 0.0, 1.0)
 
-    source_log_gain = np.zeros_like(y, dtype=np.float32)
-    per_class: dict[str, object] = {}
+    # Guards operate on original luminance: hold true blacks, protect highlights.
+    black_anchor = _smoothstep(0.025, 0.13, y)
+    highlight_guard = 1.0 - _smoothstep(0.68, 0.92, y)
+    final_gain = final_gain * black_anchor * highlight_guard
 
-    # WALLS — one gain per connected wall component.
-    wall_target_map = np.asarray(
-        tones["wall_target_map"],
-        dtype=np.float32,
-    )
-    wall_field, wall_components = _component_constant_log_gain(
-        luminance=y,
-        mask=wall_soft,
-        target_map=wall_target_map,
-        min_component_fraction=0.01,
-        max_gain=1.55,
-    )
-    source_log_gain = np.maximum(source_log_gain, wall_field)
-    per_class["wall_components"] = wall_components
-
-    # CEILING — one robust gain for the full ceiling.
-    ceiling_pixels = ceiling_soft > 0.5
-    if np.any(ceiling_pixels):
-        ceiling_before = float(np.median(y[ceiling_pixels]))
-        ceiling_target = float(tones["ceiling"]["target"])
-        ceiling_gain = float(
-            np.clip(
-                ceiling_target / max(ceiling_before, 0.08),
-                1.0,
-                2.10,
-            )
-        )
-        ceiling_log_gain = float(np.log(ceiling_gain))
-        source_log_gain = np.maximum(
-            source_log_gain,
-            ceiling_log_gain * (ceiling_soft > 0.35).astype(np.float32),
-        )
-        per_class["ceiling"] = {
-            "median_before": ceiling_before,
-            "target": ceiling_target,
-            "gain": ceiling_gain,
-        }
-    else:
-        per_class["ceiling"] = {
-            "median_before": None,
-            "target": None,
-            "gain": 1.0,
-        }
-
-    # Doors get only a restrained multiplicative correction.
-    door_pixels = door_soft > 0.5
-    if np.any(door_pixels):
-        door_before = float(np.median(y[door_pixels]))
-        door_target = float(tones["door"]["target"])
-        door_gain = float(
-            np.clip(
-                door_target / max(door_before, 0.08),
-                1.0,
-                1.25,
-            )
-        )
-        source_log_gain = np.maximum(
-            source_log_gain,
-            float(np.log(door_gain))
-            * (door_soft > 0.35).astype(np.float32),
-        )
-        per_class["door"] = {
-            "median_before": door_before,
-            "target": door_target,
-            "gain": door_gain,
-        }
-    else:
-        per_class["door"] = {
-            "median_before": None,
-            "target": None,
-            "gain": 1.0,
-        }
-
-    # Edge-aware propagation of room illumination.
-    propagation_radius = max(16, round(max_side / 100))
-    propagated, propagation_mode = _guided_smooth(
-        guide_rgb=rgb,
-        field=source_log_gain,
-        radius=propagation_radius,
-        eps=8e-4,
-    )
-    propagated = np.clip(propagated, 0.0, np.log(2.10))
-
-    # Keep direct structure correction on wall/ceiling/door only.
-    direct_structure = np.maximum.reduce([
-        (wall_soft > 0.20).astype(np.float32),
-        (ceiling_soft > 0.20).astype(np.float32),
-        (door_soft > 0.20).astype(np.float32),
-    ])
-    direct_log_gain = propagated * direct_structure
-
-    # Materials inherit only weak ambient illumination and never direct lift.
-    inherit_factor = float(
-        np.clip(analysis.get("material_inherit_factor", 0.08), 0.0, 0.12)
-    )
-    inherited_log_gain = propagated * inherit_factor * material_lock
-
-    # Hard caps prevent floor/cabinet/furniture over-brightening.
-    max_material_gain = 1.08
-    inherited_log_gain = np.minimum(
-        inherited_log_gain,
-        np.log(max_material_gain),
-    )
-
-    final_log_gain = np.maximum(
-        direct_log_gain * (1.0 - material_lock),
-        inherited_log_gain,
-    )
-    final_log_gain *= 1.0 - exclusion_hard
-
-    # Protect true blacks and bright highlights without changing hue.
-    black_anchor = _smoothstep(0.018, 0.10, y)
-    highlight_guard = 1.0 - _smoothstep(0.72, 0.95, y)
-    final_log_gain *= black_anchor * highlight_guard
-
-    out, reconstructed_y = _apply_illumination_gain(
-        rgb=rgb,
-        illumination=illumination,
-        reflectance=reflectance,
-        log_gain=final_log_gain,
-    )
-    out_y = _luminance(out)
-
-    wall_gain_values = np.exp(final_log_gain[wall_soft > 0.5])
-    floor_gain_values = np.exp(final_log_gain[floor_hard > 0.5])
-    material_gain_values = np.exp(final_log_gain[material_lock > 0.5])
+    out = _apply_log_gain(rgb, final_gain)
+    y_after = _luminance(out)
 
     return out, {
-        "route": "SEMANTIC_PHASE3_FIX2",
-        "method": "intrinsic_log_luminance_ratio_preserving_rgb",
-        "decomposition_mode": decomposition_mode,
-        "decomposition_radius": int(decomposition_radius),
-        "reflectance_std": float(np.std(reflectance)),
+        "route": "SEMANTIC_PHASE3",
+        "model": "log_luminance_multiplicative_v3.2",
         "per_class": per_class,
         "propagation_mode": propagation_mode,
-        "propagation_radius": int(propagation_radius),
-        "material_inherit_factor": inherit_factor,
-        "max_material_gain": max_material_gain,
-        "chroma_compensation": "retired",
-        "wall_gain_mean": (
-            float(np.mean(wall_gain_values))
-            if wall_gain_values.size
-            else 1.0
-        ),
-        "wall_gain_std": (
-            float(np.std(wall_gain_values))
-            if wall_gain_values.size
+        "field_mode": field_mode,
+        "propagation_radius": int(radius),
+        "field_sigma": float(field_sigma),
+        "material_inherit_factor": material_inherit_factor,
+        "mean_material_inherited_gain": (
+            float(np.mean(inherited_material_gain[protected_all > 0.5]))
+            if np.any(protected_all > 0.5)
             else 0.0
         ),
-        "floor_gain_mean": (
-            float(np.mean(floor_gain_values))
-            if floor_gain_values.size
-            else 1.0
+        "max_floor_lift": (
+            float(np.max(y_after[floor > 0.5] - y[floor > 0.5]))
+            if np.any(floor > 0.5)
+            else 0.0
         ),
-        "floor_gain_max": (
-            float(np.max(floor_gain_values))
-            if floor_gain_values.size
-            else 1.0
-        ),
-        "protected_gain_mean": (
-            float(np.mean(material_gain_values))
-            if material_gain_values.size
-            else 1.0
-        ),
-        "protected_gain_max": (
-            float(np.max(material_gain_values))
-            if material_gain_values.size
-            else 1.0
-        ),
-        "floor_luminance_before": (
-            float(np.mean(y[floor_hard > 0.5]))
-            if np.any(floor_hard > 0.5)
-            else None
-        ),
-        "floor_luminance_after": (
-            float(np.mean(out_y[floor_hard > 0.5]))
-            if np.any(floor_hard > 0.5)
-            else None
-        ),
+        "chroma_boost_max": 1.0,  # retired: multiplicative model needs none
+        "mean_image_luminance_before": float(np.mean(y)),
+        "mean_image_luminance_after": float(np.mean(y_after)),
     }
 
 
@@ -437,46 +260,34 @@ def global_safe_exposure(
     analysis: dict,
 ) -> tuple[np.ndarray, dict]:
     """
-    Conservative fallback route.
-
-    Kept deliberately restrained during Checkpoint A. It now uses a scalar
-    multiplicative illumination gain instead of additive LAB/chroma boosting.
+    Conservative fallback route, migrated to the same multiplicative model
+    (no LAB additive lift, no chroma boost).
     """
     y = _luminance(rgb)
     local = cv2.GaussianBlur(y, (0, 0), 36.0)
 
     dark_region = 1.0 - _smoothstep(0.22, 0.58, local)
     shadow_pixels = 1.0 - _smoothstep(0.16, 0.56, y)
-    mid_pixels = np.clip(
-        1.0 - np.abs(y - 0.46) / 0.34,
-        0.0,
-        1.0,
-    )
+    mid_pixels = np.clip(1.0 - np.abs(y - 0.46) / 0.34, 0.0, 1.0)
 
-    shadow_lift = float(analysis["shadow_lift"]) * 0.35
-    midtone_lift = float(analysis["midtone_lift"]) * 0.35
+    black_anchor = _smoothstep(0.025, 0.13, y)
+    highlight_guard = 1.0 - _smoothstep(0.68, 0.92, y)
 
-    requested = (
+    shadow_lift = float(analysis["shadow_lift"]) * 0.50
+    midtone_lift = float(analysis["midtone_lift"]) * 0.50
+
+    linear_lift = (
         shadow_lift * (0.55 * shadow_pixels + 0.45 * dark_region)
         + midtone_lift * (0.55 * mid_pixels + 0.45 * dark_region)
-    )
+    ) * black_anchor * highlight_guard
 
-    # Convert the old requested lift into a bounded multiplicative gain.
-    gain = 1.0 + np.clip(requested * 1.10, 0.0, 0.22)
-    log_gain = np.log(gain)
-
-    black_anchor = _smoothstep(0.018, 0.10, y)
-    highlight_guard = 1.0 - _smoothstep(0.72, 0.95, y)
-    log_gain *= black_anchor * highlight_guard
-
-    out = _apply_multiplicative_gain(rgb, log_gain)
+    log_gain = np.log(np.clip((y + linear_lift) / np.maximum(y, 1e-4), 1.0, 2.5))
+    out = _apply_log_gain(rgb, log_gain)
 
     return out, {
-        "route": "GLOBAL_SAFE_CHECKPOINT_A",
-        "method": "multiplicative_linear_rgb",
-        "shadow_lift_input": shadow_lift,
-        "midtone_lift_input": midtone_lift,
-        "gain_mean": float(np.mean(np.exp(log_gain))),
-        "gain_max": float(np.max(np.exp(log_gain))),
-        "chroma_compensation": "retired",
+        "route": "GLOBAL_SAFE",
+        "model": "log_luminance_multiplicative_v3.2",
+        "shadow_lift": shadow_lift,
+        "midtone_lift": midtone_lift,
+        "chroma_boost_max": 1.0,
     }

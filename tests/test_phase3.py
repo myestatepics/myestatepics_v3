@@ -36,25 +36,25 @@ def test_floor_has_no_direct_target():
         image,
         scene,
         tones,
-        {"material_inherit_factor": 0.08},
+        {"material_inherit_factor": 1.0},
     )
     assert log["per_class"]["floor"]["mode"] == "protected_no_direct_target"
-    assert log["max_floor_lift"] < 0.06
 
 
-def test_material_inherit_factor_is_small():
+def test_material_inherits_full_field():
+    # v3.2 Fix 4: materials receive the FULL illumination field, not 8%.
     shape = (240, 320)
     scene = make_scene(shape)
-    image = np.full((240, 320, 3), 90, np.uint8)
+    image = np.full((240, 320, 3), 60, np.uint8)  # dark room -> real lift
     tones, _ = classify_tones(image, scene, {})
     _, log = adaptive_per_class_exposure(
         image,
         scene,
         tones,
-        {"material_inherit_factor": 0.08},
+        {"material_inherit_factor": 1.0},
     )
-    assert log["material_inherit_factor"] == 0.08
-    assert log["mean_material_inherited_lift"] < 0.05
+    assert log["material_inherit_factor"] == 1.0
+    assert log["mean_material_inherited_gain"] > 0.02
 
 
 def test_floor_change_routes_review():
@@ -62,7 +62,7 @@ def test_floor_change_routes_review():
     scene = make_scene(shape)
     original = np.full((240, 320, 3), 100, np.uint8)
     final = original.copy()
-    final[180:] = 140
+    final[180:] = 165  # shift ~0.25: abnormal even with full inheritance
     tones, _ = classify_tones(original, scene, {})
     qc = evaluate(original, final, scene, tones)
     assert "FLOOR_BRIGHTNESS_CHANGED" in qc["flags"]

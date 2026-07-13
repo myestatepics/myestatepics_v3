@@ -21,14 +21,13 @@
     "floor_medium_target_cap": 0.52,
     "floor_dark_lift": 0.1,
     "floor_dark_max_lift": 0.12,
-    "ceiling_neutral_l_threshold": 0.55,
     "ceiling_neutral_chroma_threshold": 14.0,
     "ceiling_target": 0.8,
     "ceiling_nonneutral_lift": 0.12,
     "ceiling_nonneutral_max_lift": 0.15,
     "door_light_target": 0.68,
     "door_dark_lift": 0.1,
-    "furnishing_factor": 0.08,
+    "furnishing_factor": 1.0,
     "protected_chroma_restore_strength": 0.22,
     "wb_high_limits": [
       0.75,
@@ -37,7 +36,8 @@
     "wb_low_limits": [
       0.82,
       1.22
-    ]
+    ],
+    "ceiling_sanity_l_floor": 0.15
   },
   "workflow": {
     "create_scored_comparisons": true,
@@ -45,10 +45,10 @@
     "conservative_final_routing": true,
     "minimum_final_score": 80
   },
-  "version": "3.0-phase3-test",
+  "version": "3.2.0",
   "phase3": {
     "floor_direct_target_enabled": false,
-    "material_inherit_factor": 0.08,
+    "material_inherit_factor": 1.0,
     "edge_aware_propagation": true,
     "window_recovery_adaptive": true
   }

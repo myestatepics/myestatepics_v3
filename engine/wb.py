@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import cv2
@@ -22,10 +23,7 @@ def _valid_reference(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return (mask > 0.5) & (y > 0.08) & (y < 0.95) & (chroma < 20.0)
 
 
-def _gains_from_pixels(
-    f: np.ndarray,
-    valid: np.ndarray,
-) -> tuple[np.ndarray, int, np.ndarray]:
+def _gains_from_pixels(f: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, int, np.ndarray]:
     count = int(np.count_nonzero(valid))
     if count == 0:
         return np.ones(3, dtype=np.float32), 0, np.ones(3, dtype=np.float32)
@@ -35,63 +33,36 @@ def _gains_from_pixels(
     return gains.astype(np.float32), count, medians.astype(np.float32)
 
 
-def rough_global_white_balance(
-    rgb: np.ndarray,
-    scene: Scene,
-) -> tuple[np.ndarray, dict]:
-    """Pass 1: break strong casts before semantic tone/reference decisions.
-
-    Uses a shades-of-gray (Minkowski p=6) estimate on the semantic structure
-    mask. This pass is deliberately broad but bounded. It is skipped when all
-    three estimated gains are already within +/-3 percent of unity.
+def global_pass1_wb(rgb: np.ndarray, scene: Scene) -> tuple[np.ndarray, dict]:
+    """
+    v3.2 Fix 1 (pass 1 of two-pass WB): remove the bulk of any global cast
+    BEFORE neutral-reference validation, so a strong cast cannot disqualify
+    the ceiling reference (the circular-validation bug).
+    Shades-of-gray (Minkowski p=6) over the structure mask, limits [0.72, 1.35].
+    Skipped (identity) when computed gains are all within 1.0 +/- 0.03.
     """
     f = _rgb_float(rgb)
     y = _luminance(f)
-    h, w = y.shape
-
-    structure = scene.masks.get(
-        "structure",
-        np.ones((h, w), dtype=np.float32),
-    ) > 0.5
-    valid = structure & (y > 0.04) & (y < 0.95)
-    if np.count_nonzero(valid) < 2000:
-        valid = (y > 0.04) & (y < 0.95)
-
-    samples = f[valid]
-    if samples.size == 0:
-        return rgb.copy(), {
-            "reference_used": "pass1_none",
-            "applied": False,
-            "gains": [1.0, 1.0, 1.0],
-            "raw_gains": [1.0, 1.0, 1.0],
-            "limits_used": [0.72, 1.35],
-            "reference_pixel_count": 0,
-        }
-
-    illum = np.power(
-        np.mean(np.power(np.clip(samples, 1e-6, 1.0), 6.0), axis=0),
-        1.0 / 6.0,
-    )
-    target = float(np.mean(illum))
-    raw_gains = target / np.maximum(illum, 1e-5)
-    gains = np.clip(raw_gains, 0.72, 1.35).astype(np.float32)
-    applied = bool(np.any(np.abs(gains - 1.0) > 0.03))
-
-    if applied:
-        corrected = np.clip(f * gains[None, None, :], 0.0, 1.0)
-        out = np.clip(corrected * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    structure = scene.masks.get("structure")
+    if structure is not None and np.count_nonzero(structure > 0.5) >= 2000:
+        sel = (structure > 0.5) & (y > 0.04) & (y < 0.95)
     else:
-        out = rgb.copy()
-        gains = np.ones(3, dtype=np.float32)
-
-    return out, {
-        "reference_used": "pass1_structure_shades_of_gray",
-        "applied": applied,
-        "illuminant": [float(x) for x in illum],
-        "raw_gains": [float(x) for x in raw_gains],
-        "gains": [float(x) for x in gains],
-        "limits_used": [0.72, 1.35],
-        "reference_pixel_count": int(samples.shape[0]),
+        sel = (y > 0.04) & (y < 0.95)
+    samples = f[sel]
+    if samples.shape[0] < 500:
+        return rgb.copy(), {"pass1_applied": False, "pass1_gains": [1.0, 1.0, 1.0],
+                            "pass1_reason": "insufficient_pixels"}
+    illum = np.power(np.mean(np.power(np.clip(samples, 1e-6, 1.0), 6.0), axis=0), 1.0 / 6.0)
+    target = float(np.mean(illum))
+    gains = np.clip(target / np.maximum(illum, 1e-5), 0.72, 1.35).astype(np.float32)
+    if np.all(np.abs(gains - 1.0) <= 0.03):
+        return rgb.copy(), {"pass1_applied": False, "pass1_gains": [float(g) for g in gains],
+                            "pass1_reason": "within_noop_band"}
+    out = np.clip(f * gains[None, None, :], 0.0, 1.0)
+    return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8), {
+        "pass1_applied": True,
+        "pass1_gains": [float(g) for g in gains],
+        "pass1_reason": "cast_detected",
     }
 
 
@@ -100,7 +71,6 @@ def semantic_white_balance(
     scene: Scene,
     tones: dict,
 ) -> tuple[np.ndarray, dict]:
-    """Pass 2: semantic refinement on the pass-1 corrected frame."""
     f = _rgb_float(rgb)
     h, w = rgb.shape[:2]
     reference_used = "shades_of_gray"
@@ -120,15 +90,10 @@ def semantic_white_balance(
             right[:, :w // 2] = False
             gl, cl, _ = _gains_from_pixels(f, left)
             gr, cr, _ = _gains_from_pixels(f, right)
-            agreement = (
-                float(np.max(np.abs(gl - gr)))
-                if cl >= 800 and cr >= 800
-                else 999.0
-            )
+            agreement = float(np.max(np.abs(gl - gr))) if cl >= 800 and cr >= 800 else 999.0
             half_agreement = agreement
             if (
-                cl >= 800
-                and cr >= 800
+                cl >= 800 and cr >= 800
                 and agreement <= 0.06
                 and scene.coverage.get("ceiling", 0.0) >= 4.0
             ):
@@ -140,10 +105,7 @@ def semantic_white_balance(
         upper_wall = scene.masks["wall"].copy()
         upper_wall[int(h * 0.40):] = 0.0
         light_wall = tones["wall_class_map"] == 3
-        upper_valid = _valid_reference(
-            rgb,
-            upper_wall * light_wall.astype(np.float32),
-        )
+        upper_valid = _valid_reference(rgb, upper_wall * light_wall.astype(np.float32))
         if np.count_nonzero(upper_valid) >= 2000:
             valid = upper_valid
             reference_used = "upper_wall"
@@ -159,13 +121,7 @@ def semantic_white_balance(
         y = _luminance(f)
         sample_mask &= (y > 0.04) & (y < 0.95)
         samples = f[sample_mask]
-        illum = np.power(
-            np.mean(
-                np.power(np.clip(samples, 1e-6, 1.0), 6.0),
-                axis=0,
-            ),
-            1.0 / 6.0,
-        )
+        illum = np.power(np.mean(np.power(np.clip(samples, 1e-6, 1.0), 6.0), axis=0), 1.0 / 6.0)
         target = float(np.mean(illum))
         raw_gains = target / np.maximum(illum, 1e-5)
         pixel_count = int(samples.shape[0])
@@ -191,16 +147,9 @@ def global_safe_white_balance(rgb: np.ndarray) -> tuple[np.ndarray, dict]:
     y = _luminance(f)
     valid = (y > 0.04) & (y < 0.95)
     samples = f[valid]
-    illum = np.power(
-        np.mean(np.power(np.clip(samples, 1e-6, 1.0), 6.0), axis=0),
-        1.0 / 6.0,
-    )
+    illum = np.power(np.mean(np.power(np.clip(samples, 1e-6, 1.0), 6.0), axis=0), 1.0 / 6.0)
     target = float(np.mean(illum))
-    gains = np.clip(
-        target / np.maximum(illum, 1e-5),
-        0.85,
-        1.15,
-    ).astype(np.float32)
+    gains = np.clip(target / np.maximum(illum, 1e-5), 0.85, 1.15).astype(np.float32)
     out = np.clip(f * gains[None, None, :], 0.0, 1.0)
     return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8), {
         "reference_used": "global_safe_shades_of_gray",

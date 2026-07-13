@@ -147,14 +147,29 @@ def evaluate(
         wall_uniformity_after - wall_uniformity_before
     )
 
+    # v3.2: residual color cast on illumination surfaces after WB
+    neutral_sel = (
+        (np.maximum(scene.masks["wall"], scene.masks["ceiling"]) > 0.5)
+        & (after > 0.15) & (after < 0.95)
+    )
+    if np.any(neutral_sel):
+        residual_a = float(np.mean(np.abs(dst_lab[..., 1][neutral_sel] - 128.0)))
+        residual_b = float(np.mean(np.abs(dst_lab[..., 2][neutral_sel] - 128.0)))
+    else:
+        residual_a = residual_b = 0.0
+
     if clipped > 1.8:
         flags.append("EXCESSIVE_CLIPPING")
     if glare > 3.0:
         flags.append("WALL_GLARE")
     if protected_p95 > 9.0:
         flags.append("PROTECTED_MATERIAL_COLOR_SHIFT")
-    if floor_luminance_shift > 0.055:
+    # v3.2: floors legitimately inherit room light (full field). The gate now
+    # catches only ABNORMAL shifts; color fidelity gates remain strict.
+    if floor_luminance_shift > 0.18:
         flags.append("FLOOR_BRIGHTNESS_CHANGED")
+    if max(residual_a, residual_b) > 5.0:
+        flags.append("RESIDUAL_COLOR_CAST")
     if floor_chroma_p95 > 7.0:
         flags.append("FLOOR_COLOR_CHANGED")
     if uniformity_increase > 0.08:
@@ -176,4 +191,6 @@ def evaluate(
         "wall_uniformity_before": wall_uniformity_before,
         "wall_uniformity_after": wall_uniformity_after,
         "wall_uniformity_increase": uniformity_increase,
+        "residual_cast_a": residual_a,
+        "residual_cast_b": residual_b,
     }

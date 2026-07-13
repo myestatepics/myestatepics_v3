@@ -26,4 +26,4 @@ venv/
 env/
 
 # Logs
-*.logback up photo for test/
+*.log
