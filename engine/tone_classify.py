@@ -98,12 +98,38 @@ def classify_tones(rgb: np.ndarray, scene: Scene, settings: dict | None = None) 
         floor_target = floor_median + min(cfg.get("floor_dark_lift", 0.10), cfg.get("floor_dark_max_lift", 0.12))
 
     ceiling_median, ceiling_p70, ceiling_count = _masked_stats(y, scene.masks["ceiling"])
-    ceiling_pixels_chroma = chroma[scene.masks["ceiling"] > 0.5]
-    ceiling_chroma = float(np.median(ceiling_pixels_chroma)) if ceiling_pixels_chroma.size else 999.0
+    ceiling_binary = scene.masks["ceiling"] > 0.5
+    ceiling_valid = ceiling_binary & (y > 0.15) & (y < 0.95)
+    ceiling_pixels_chroma = chroma[ceiling_valid]
+    ceiling_chroma = (
+        float(np.median(ceiling_pixels_chroma))
+        if ceiling_pixels_chroma.size
+        else 999.0
+    )
+
+    # Neutrality is a color/spatial-consistency decision, not an exposure
+    # decision. A dark neutral ceiling remains a valid neutral reference.
+    mid = w // 2
+    left_valid = ceiling_valid.copy()
+    left_valid[:, mid:] = False
+    right_valid = ceiling_valid.copy()
+    right_valid[:, :mid] = False
+    left_chroma = chroma[left_valid]
+    right_chroma = chroma[right_valid]
+    if left_chroma.size >= 800 and right_chroma.size >= 800:
+        ceiling_chroma_half_difference = float(
+            abs(np.median(left_chroma) - np.median(right_chroma))
+        )
+        ceiling_spatially_consistent = ceiling_chroma_half_difference <= 4.0
+    else:
+        ceiling_chroma_half_difference = None
+        ceiling_spatially_consistent = ceiling_pixels_chroma.size >= 2000
+
     ceiling_neutral = bool(
-        ceiling_count > 0
-        and ceiling_median >= cfg.get("ceiling_neutral_l_threshold", 0.55)
-        and ceiling_chroma < cfg.get("ceiling_neutral_chroma_threshold", 14.0)
+        ceiling_pixels_chroma.size >= 2000
+        and ceiling_chroma
+        < cfg.get("ceiling_neutral_chroma_threshold", 14.0)
+        and ceiling_spatially_consistent
     )
     if ceiling_count == 0:
         ceiling_target = 0.0
@@ -134,6 +160,9 @@ def classify_tones(rgb: np.ndarray, scene: Scene, settings: dict | None = None) 
         "ceiling": {
             "median": ceiling_median, "p70": ceiling_p70,
             "chroma_median": ceiling_chroma,
+            "chroma_half_difference": ceiling_chroma_half_difference,
+            "spatially_consistent": ceiling_spatially_consistent,
+            "valid_reference_pixels": int(ceiling_pixels_chroma.size),
             "target": float(ceiling_target),
             "ceiling_is_neutral_reference": ceiling_neutral,
         },

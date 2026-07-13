@@ -19,7 +19,10 @@ from engine.utils import (
 from engine.refine import refine_masks
 from engine.scene import build_scene
 from engine.tone_classify import classify_tones
-from engine.wb import semantic_white_balance, global_safe_white_balance
+from engine.wb import (
+    rough_global_white_balance, semantic_white_balance,
+    global_safe_white_balance,
+)
 from engine.tonal import adaptive_per_class_exposure, global_safe_exposure
 from engine.windows2 import treat_window_zones
 from engine.materials2 import restore_protected_chroma
@@ -164,7 +167,10 @@ def main() -> int:
             )
             scene = build_scene(refined, original.shape[:2])
             tone_settings = settings.get("targets", {})
-            tones, tones_log = classify_tones(original, scene, tone_settings)
+            # Fix 1: break strong casts before tone classification so a dark,
+            # cast ceiling is not incorrectly rejected as non-neutral.
+            pass1_wb, pass1_wb_log = rough_global_white_balance(original, scene)
+            tones, tones_log = classify_tones(pass1_wb, scene, tone_settings)
             analysis = analyze_image(original).to_dict()
             analysis["furnishing_protection"] = float(tone_settings.get("furnishing_factor", 0.08))
             analysis["material_inherit_factor"] = float(settings.get("phase3", {}).get("material_inherit_factor", 0.08))
@@ -183,7 +189,20 @@ def main() -> int:
                 )
 
             if scene.route == "SEMANTIC":
-                wb, wb_log = semantic_white_balance(original, scene, tones)
+                wb, pass2_wb_log = semantic_white_balance(pass1_wb, scene, tones)
+                wb_log = {
+                    "mode": "two_pass_semantic",
+                    "pass1": pass1_wb_log,
+                    "pass2": pass2_wb_log,
+                    # Keep top-level keys used by scoring/backward compatibility.
+                    "reference_used": pass2_wb_log.get("reference_used"),
+                    "confidence": pass2_wb_log.get("confidence"),
+                    "gains": pass2_wb_log.get("gains"),
+                    "limits_used": pass2_wb_log.get("limits_used"),
+                    "reference_pixel_count": pass2_wb_log.get(
+                        "reference_pixel_count", 0
+                    ),
+                }
                 if debug_recorder is not None:
                     debug_recorder.save_stage("01_after_wb", "After white balance", wb)
 
