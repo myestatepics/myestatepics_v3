@@ -107,35 +107,94 @@ def _component_constant_log_gain(
     return field, logs
 
 
+def _estimate_log_illumination(
+    rgb: np.ndarray,
+    luminance: np.ndarray,
+    radius: int,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """
+    Phase 3 Q4 intrinsic decomposition.
+
+    log(Y) = illumination + reflectance
+
+    The illumination layer is an edge-aware, low-frequency estimate.
+    Reflectance contains material identity: grain, texture, paint variation,
+    and local contrast. Exposure changes are applied to illumination only.
+    """
+    log_y = np.log(np.clip(luminance, _EPS, 1.0)).astype(np.float32)
+
+    illumination, mode = _guided_smooth(
+        guide_rgb=rgb,
+        field=log_y,
+        radius=max(24, int(radius)),
+        eps=2.5e-3,
+    )
+    illumination = illumination.astype(np.float32)
+    reflectance = (log_y - illumination).astype(np.float32)
+
+    return illumination, reflectance, mode
+
+
+def _apply_illumination_gain(
+    rgb: np.ndarray,
+    illumination: np.ndarray,
+    reflectance: np.ndarray,
+    log_gain: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Phase 3 Q5 multiplicative recombination.
+
+    Reconstruct:
+        Y' = exp(illumination + log_gain + reflectance)
+
+    Then apply the scalar ratio Y'/Y to RGB. The same scalar is applied to
+    every channel, preserving material RGB ratios and therefore hue.
+    """
+    original_y = np.exp(illumination + reflectance).astype(np.float32)
+    corrected_y = np.exp(
+        illumination + log_gain.astype(np.float32) + reflectance
+    ).astype(np.float32)
+
+    scalar = corrected_y / np.maximum(original_y, _EPS)
+    scalar = np.clip(scalar, 0.25, 4.0).astype(np.float32)
+
+    rgb_f = rgb.astype(np.float32) / 255.0
+    corrected = rgb_f * scalar[..., None]
+
+    # Soft clipping guard: preserve ratios until a channel would exceed 1.0,
+    # then scale the entire pixel uniformly rather than clipping channels
+    # independently.
+    peak = np.max(corrected, axis=2, keepdims=True)
+    corrected = np.where(
+        peak > 1.0,
+        corrected / np.maximum(peak, 1.0),
+        corrected,
+    )
+
+    out = np.clip(corrected * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return out, corrected_y
+
+
 def _apply_multiplicative_gain(
     rgb: np.ndarray,
     log_gain: np.ndarray,
 ) -> np.ndarray:
     """
-    Apply illumination in linear RGB using one scalar gain per pixel.
+    Compatibility wrapper used by the global-safe route and older tests.
 
-    Multiplying all three channels by the same gain preserves RGB ratios,
-    material hue, and saturation far better than additive LAB lifting.
+    It now uses the same ratio-preserving RGB recombination as the semantic
+    Phase 3 path.
     """
-    srgb = rgb.astype(np.float32) / 255.0
-
-    # sRGB -> approximate linear light.
-    linear = np.where(
-        srgb <= 0.04045,
-        srgb / 12.92,
-        ((srgb + 0.055) / 1.055) ** 2.4,
+    y = _luminance(rgb)
+    illumination = np.log(np.clip(y, _EPS, 1.0)).astype(np.float32)
+    reflectance = np.zeros_like(illumination, dtype=np.float32)
+    out, _ = _apply_illumination_gain(
+        rgb=rgb,
+        illumination=illumination,
+        reflectance=reflectance,
+        log_gain=log_gain,
     )
-
-    gain = np.exp(log_gain).astype(np.float32)
-    corrected = np.clip(linear * gain[..., None], 0.0, 1.0)
-
-    # Linear light -> sRGB.
-    out = np.where(
-        corrected <= 0.0031308,
-        corrected * 12.92,
-        1.055 * np.power(corrected, 1.0 / 2.4) - 0.055,
-    )
-    return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return out
 
 
 def adaptive_per_class_exposure(
@@ -145,7 +204,7 @@ def adaptive_per_class_exposure(
     analysis: dict,
 ) -> tuple[np.ndarray, dict]:
     """
-    Checkpoint A: physically motivated illumination correction.
+    Phase 3 Fix 2: intrinsic log-luminance illumination correction.
 
     Design rule:
         Correct the light, never the materials.
@@ -161,6 +220,13 @@ def adaptive_per_class_exposure(
     y = _luminance(rgb)
     h, w = y.shape
     max_side = max(h, w)
+
+    decomposition_radius = max(32, round(max_side / 32))
+    illumination, reflectance, decomposition_mode = _estimate_log_illumination(
+        rgb=rgb,
+        luminance=y,
+        radius=decomposition_radius,
+    )
 
     wall_soft = np.clip(scene.masks["wall"], 0.0, 1.0)
     ceiling_soft = np.clip(scene.masks["ceiling"], 0.0, 1.0)
@@ -299,7 +365,12 @@ def adaptive_per_class_exposure(
     highlight_guard = 1.0 - _smoothstep(0.72, 0.95, y)
     final_log_gain *= black_anchor * highlight_guard
 
-    out = _apply_multiplicative_gain(rgb, final_log_gain)
+    out, reconstructed_y = _apply_illumination_gain(
+        rgb=rgb,
+        illumination=illumination,
+        reflectance=reflectance,
+        log_gain=final_log_gain,
+    )
     out_y = _luminance(out)
 
     wall_gain_values = np.exp(final_log_gain[wall_soft > 0.5])
@@ -307,8 +378,11 @@ def adaptive_per_class_exposure(
     material_gain_values = np.exp(final_log_gain[material_lock > 0.5])
 
     return out, {
-        "route": "SEMANTIC_CHECKPOINT_A",
-        "method": "multiplicative_linear_rgb_log_illumination",
+        "route": "SEMANTIC_PHASE3_FIX2",
+        "method": "intrinsic_log_luminance_ratio_preserving_rgb",
+        "decomposition_mode": decomposition_mode,
+        "decomposition_radius": int(decomposition_radius),
+        "reflectance_std": float(np.std(reflectance)),
         "per_class": per_class,
         "propagation_mode": propagation_mode,
         "propagation_radius": int(propagation_radius),
