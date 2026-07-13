@@ -23,6 +23,23 @@ def _valid_reference(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return (mask > 0.5) & (y > 0.08) & (y < 0.95) & (chroma < 20.0)
 
 
+def _smoothstep(a: float, b: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - a) / max(b - a, 1e-6), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _apply_gains_shadow_protected(f: np.ndarray, gains: np.ndarray) -> np.ndarray:
+    """
+    v3.3: white balance fades out in deep shadows. Near-black pixels carry
+    noise, not color information; scaling their channels differently tints
+    black paint pink/green. Gains blend to identity below L ~0.10.
+    """
+    y = _luminance(f)
+    w = _smoothstep(0.03, 0.10, y)[..., None]
+    effective = 1.0 + (gains[None, None, :] - 1.0) * w
+    return np.clip(f * effective, 0.0, 1.0)
+
+
 def _gains_from_pixels(f: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, int, np.ndarray]:
     count = int(np.count_nonzero(valid))
     if count == 0:
@@ -58,7 +75,7 @@ def global_pass1_wb(rgb: np.ndarray, scene: Scene) -> tuple[np.ndarray, dict]:
     if np.all(np.abs(gains - 1.0) <= 0.03):
         return rgb.copy(), {"pass1_applied": False, "pass1_gains": [float(g) for g in gains],
                             "pass1_reason": "within_noop_band"}
-    out = np.clip(f * gains[None, None, :], 0.0, 1.0)
+    out = _apply_gains_shadow_protected(f, gains)
     return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8), {
         "pass1_applied": True,
         "pass1_gains": [float(g) for g in gains],
@@ -129,7 +146,7 @@ def semantic_white_balance(
 
     limits = (0.75, 1.32) if confidence == "HIGH" else (0.82, 1.22)
     gains = np.clip(raw_gains, limits[0], limits[1]).astype(np.float32)
-    corrected = np.clip(f * gains[None, None, :], 0.0, 1.0)
+    corrected = _apply_gains_shadow_protected(f, gains)
 
     return np.clip(corrected * 255.0 + 0.5, 0, 255).astype(np.uint8), {
         "reference_used": reference_used,
@@ -150,7 +167,7 @@ def global_safe_white_balance(rgb: np.ndarray) -> tuple[np.ndarray, dict]:
     illum = np.power(np.mean(np.power(np.clip(samples, 1e-6, 1.0), 6.0), axis=0), 1.0 / 6.0)
     target = float(np.mean(illum))
     gains = np.clip(target / np.maximum(illum, 1e-5), 0.85, 1.15).astype(np.float32)
-    out = np.clip(f * gains[None, None, :], 0.0, 1.0)
+    out = _apply_gains_shadow_protected(f, gains)
     return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8), {
         "reference_used": "global_safe_shades_of_gray",
         "confidence": "LOW",

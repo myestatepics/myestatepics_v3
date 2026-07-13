@@ -20,6 +20,7 @@ from engine.refine import refine_masks
 from engine.scene import build_scene
 from engine.tone_classify import classify_tones
 from engine.wb import semantic_white_balance, global_safe_white_balance, global_pass1_wb
+from engine.profiles import detect_room_profile
 from engine.tonal import adaptive_per_class_exposure, global_safe_exposure
 from engine.windows2 import treat_window_zones
 from engine.materials2 import restore_protected_chroma
@@ -170,10 +171,14 @@ def main() -> int:
             # strong cast can no longer disqualify its own best witness (the
             # ceiling) and a dark room no longer loses its 0.80 ceiling target.
             pass1, pass1_log = global_pass1_wb(original, scene)
+            profile_name, profile_targets, profile_dynamics = detect_room_profile(scene, pass1)
+            tone_settings = {**tone_settings, **profile_targets}
             tones, tones_log = classify_tones(pass1, scene, tone_settings)
             analysis = analyze_image(pass1).to_dict()
             analysis["furnishing_protection"] = float(tone_settings.get("furnishing_factor", 1.0))
             analysis["material_inherit_factor"] = float(settings.get("phase3", {}).get("material_inherit_factor", 1.0))
+            analysis.update(profile_dynamics)
+            analysis["room_profile"] = profile_name
 
             debug_recorder = None
             if args.debug_stages:
@@ -291,7 +296,8 @@ def main() -> int:
                 "coverage": scene.coverage,
                 "tones": tones_log,
                 "analysis": analysis,
-                "white_balance": wb_log,
+                "room_profile": profile_name,
+                    "white_balance": wb_log,
                 "exposure": exposure_log,
                 "windows": window_log,
                 "materials": materials_log,
