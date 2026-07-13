@@ -116,6 +116,16 @@ def scenarios() -> list[dict]:
             },
         },
         {
+            # z-66/z-17 real-photo lesson: ceilings carry color BOUNCE from
+            # floors/walls. Lifting must CLEAN the tint, never amplify it.
+            "name": "bounce_tinted_ceiling",
+            "rgb": _room([0.34, 0.295, 0.285], [0.30] * 3, [0.28, 0.15, 0.09], seed=13),
+            "gates": {
+                "ceiling_chroma_must_drop": True,
+                "ceiling_median_min": 0.55,
+            },
+        },
+        {
             "name": "already_good_noop",
             "rgb": _room([0.78] * 3, [0.60] * 3, [0.45, 0.34, 0.24], seed=5),
             "gates": {
@@ -150,6 +160,8 @@ def evaluate_gates(rgb, final, gates) -> tuple[dict, list[str]]:
     ceil_rgb = f[:270].reshape(-1, 3).mean(axis=0)
 
     metrics = {
+        "ceiling_chroma_before": _chroma_mean(rgb, cm),
+        "ceiling_chroma_after": _chroma_mean(final, cm),
         "residual_cast": float(ceil_rgb.max() - ceil_rgb.min()),
         "image_mean_before": float(y0.mean()),
         "image_mean_after": float(y1.mean()),
@@ -179,6 +191,8 @@ def evaluate_gates(rgb, final, gates) -> tuple[dict, list[str]]:
         "floor_lift_ratio_max": lambda v: metrics["floor_lift_ratio"] <= v,
         "floor_chroma_ratio_max": lambda v: metrics["floor_chroma_ratio"] <= v,
         "floor_hue_drift_max_deg": lambda v: metrics["floor_hue_drift_deg"] <= v,
+        "ceiling_chroma_must_drop": lambda v: (not v) or (
+            metrics["ceiling_chroma_after"] < metrics["ceiling_chroma_before"]),
     }
     for gate, value in gates.items():
         if not checks[gate](value):

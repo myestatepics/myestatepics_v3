@@ -106,7 +106,9 @@ def classify_tones(rgb: np.ndarray, scene: Scene, settings: dict | None = None) 
     ceiling_neutral = bool(
         ceiling_count > 0
         and ceiling_median > cfg.get("ceiling_sanity_l_floor", 0.15)
-        and ceiling_chroma < cfg.get("ceiling_neutral_chroma_threshold", 14.0)
+        and ceiling_chroma < cfg.get("ceiling_neutral_chroma_threshold", 22.0)
+        # 22 not 14: real ceilings carry color BOUNCE from floors/walls.
+        # Bounce is illumination, not paint -- it is ours to remove.
     )
     if ceiling_count == 0:
         ceiling_target = 0.0

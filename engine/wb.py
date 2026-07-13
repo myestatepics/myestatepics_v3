@@ -20,7 +20,7 @@ def _valid_reference(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     y = _luminance(f)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     chroma = np.sqrt((lab[..., 1] - 128.0) ** 2 + (lab[..., 2] - 128.0) ** 2)
-    return (mask > 0.5) & (y > 0.08) & (y < 0.95) & (chroma < 20.0)
+    return (mask > 0.5) & (y > 0.08) & (y < 0.95) & (chroma < 24.0)
 
 
 def _smoothstep(a: float, b: float, x: np.ndarray) -> np.ndarray:

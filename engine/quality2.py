@@ -40,6 +40,10 @@ def evaluate(
 
     if np.any(wall_mask):
         target_median = float(np.median(wall_target[wall_mask]))
+        eff_list = tones.get("wall_effective_targets") or []
+        if eff_list:
+            # judge against what the safety caps actually allowed
+            target_median = min(target_median, max(e["effective"] for e in eff_list))
         achieved_median = float(np.median(after[wall_mask]))
         achieved["wall"] = {
             "target": target_median,
@@ -53,7 +57,7 @@ def evaluate(
 
     ceiling_mask = scene.masks["ceiling"] > 0.5
     if np.any(ceiling_mask):
-        target = float(tones["ceiling"]["target"])
+        target = float(tones["ceiling"].get("effective_target", tones["ceiling"]["target"]))
         median_after = float(np.median(after[ceiling_mask]))
         achieved["ceiling"] = {
             "target": target,
