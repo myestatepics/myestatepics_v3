@@ -59,5 +59,18 @@
     "chroma_restore_strength": 0.5,
     "floor_chroma_restore_strength": 0.62,
     "ceiling_chroma_limit": 3.0
+  },
+  "quality_validation": {
+    "highlight_clip_percent": 1.8,
+    "shadow_clip_percent": 3.0,
+    "global_brightness_delta": 0.2,
+    "wb_gain_deviation": 0.18,
+    "protected_chroma_p95": 9.0,
+    "floor_chroma_p95": 7.0,
+    "material_hue_p95": 8.0,
+    "material_saturation_p95": 0.16,
+    "floor_luminance_shift": 0.18,
+    "wall_uniformity_increase": 0.08,
+    "residual_cast": 5.0
   }
 }

@@ -287,7 +287,15 @@ def main() -> int:
             if final.shape[:2] != original_shape:
                 raise RuntimeError(f"Resolution changed: {original_shape} -> {final.shape[:2]}")
 
-            quality = evaluate(quality_reference, final, scene, tones)
+            quality = evaluate(
+                quality_reference,
+                final,
+                scene,
+                tones,
+                settings=settings,
+                wb_log=wb_log,
+                exposure_log=exposure_log,
+            )
 
             # Save temporarily so output-quality checks can inspect the actual export settings.
             provisional_path = project / "output/review" / path.name
