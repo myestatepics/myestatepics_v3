@@ -1,9 +1,11 @@
+import cv2
 import numpy as np
 
 from engine.scene import build_scene
 from engine.wb import (
     WhiteBalanceConfig,
     conservative_white_balance,
+    gentle_wall_chroma_consistency,
     global_pass1_wb,
     semantic_white_balance,
 )
@@ -78,3 +80,29 @@ def test_dtype_and_dimensions_are_preserved():
     out, _ = conservative_white_balance(image, None)
     assert out.shape == image.shape
     assert out.dtype == np.uint8
+
+
+def test_mixed_lit_ceiling_is_rejected_as_global_reference():
+    h, w = 360, 480
+    image = np.full((h, w, 3), 128, np.uint8)
+    image[: h // 3, : w // 2] = [170, 130, 90]
+    image[: h // 3, w // 2 :] = [100, 130, 170]
+    _, log = conservative_white_balance(image, _scene(h, w))
+    assert log["reference_used"] != "ceiling"
+
+
+def test_wall_consistency_is_chroma_only_and_feathered():
+    h, w = 240, 360
+    scene = _scene(h, w)
+    image = np.full((h, w, 3), [130, 130, 130], np.uint8)
+    image[h // 3 : 2 * h // 3, : w // 2] = [138, 128, 118]
+    image[h // 3 : 2 * h // 3, w // 2 :] = [118, 128, 138]
+    before_lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB).astype(np.float32)
+    out, log = gentle_wall_chroma_consistency(image, scene)
+    after_lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB).astype(np.float32)
+    wall = scene.masks["wall"] > 0.55
+    assert log["applied"] is True
+    assert np.percentile(np.abs(after_lab[..., 0][wall] - before_lab[..., 0][wall]), 95) <= 1.0
+    before_spread = np.std(before_lab[..., 1:3][wall], axis=0).mean()
+    after_spread = np.std(after_lab[..., 1:3][wall], axis=0).mean()
+    assert after_spread < before_spread

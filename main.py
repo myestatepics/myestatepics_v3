@@ -288,13 +288,15 @@ def main() -> int:
                 raise RuntimeError(f"Resolution changed: {original_shape} -> {final.shape[:2]}")
 
             quality = evaluate(
-                quality_reference,
+                original,
                 final,
                 scene,
                 tones,
                 settings=settings,
                 wb_log=wb_log,
                 exposure_log=exposure_log,
+                material_reference=quality_reference,
+                evaluate_semantic_targets=pipeline_mode != "mvp",
             )
 
             # Save temporarily so output-quality checks can inspect the actual export settings.

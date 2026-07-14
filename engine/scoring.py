@@ -52,40 +52,22 @@ def score_color_cast(quality: dict) -> CheckResult:
 
 
 def score_exposure(quality: dict) -> CheckResult:
-    achieved = quality.get("achieved_targets", {})
-    deviations: list[float] = []
-
-    for values in achieved.values():
-        target = values.get("target")
-        after = values.get("after")
-        if target is None or after is None:
-            continue
-        deviations.append(abs(float(after) - float(target)))
-
-    if not deviations:
-        return CheckResult(
-            "Exposure balance",
-            "REVIEW",
-            60,
-            "no reliable semantic exposure targets available",
-        )
-
-    mean_deviation = sum(deviations) / len(deviations)
-    worst_deviation = max(deviations)
-    score = 100.0 - mean_deviation * 180.0 - max(0.0, worst_deviation - 0.08) * 220.0
+    after = float(quality.get("global_median_brightness_after", 0.0))
+    highlight = float(quality.get("highlight_clipped_percent_excluding_windows", 0.0))
+    shadow = float(quality.get("shadow_clipped_percent_excluding_windows", 0.0))
+    brightness_penalty = max(0.0, 0.34 - after) * 180.0 + max(0.0, after - 0.72) * 180.0
+    score = 100.0 - brightness_penalty - max(0.0, highlight - 0.5) * 8.0 - max(0.0, shadow - 1.0) * 5.0
     score_i = _clamp_score(score)
-
-    missed_flags = [
-        flag for flag in quality.get("flags", [])
-        if "TARGET_MISSED" in flag or "OVERSHOT" in flag or flag == "WALL_GLARE"
-    ]
-    status = "PASS" if not missed_flags and score_i >= 78 else "REVIEW"
-    reason = (
-        f"mean target deviation {mean_deviation:.3f}; "
-        f"worst {worst_deviation:.3f}"
-    )
-    if missed_flags:
-        reason += "; " + ", ".join(missed_flags)
+    exposure_flags = {
+        "EXCESSIVE_HIGHLIGHT_CLIPPING",
+        "EXCESSIVE_SHADOW_CLIPPING",
+        "EXCESSIVE_GLOBAL_BRIGHTNESS_CHANGE",
+        "WALL_GLARE",
+    }.intersection(quality.get("flags", []))
+    status = "PASS" if not exposure_flags and score_i >= 78 else "REVIEW"
+    reason = f"global median {after:.3f}; highlight clip {highlight:.2f}%; shadow clip {shadow:.2f}%"
+    if exposure_flags:
+        reason += "; " + ", ".join(sorted(exposure_flags))
     return CheckResult("Exposure balance", status, score_i, reason)
 
 
@@ -93,6 +75,12 @@ def score_windows(window_log: dict, quality: dict) -> CheckResult:
     status_text = str(window_log.get("status", "unknown"))
     window_percent = float(window_log.get("window_percent", 0.0))
     clipping = float(quality.get("clipped_percent_after_excluding_windows", 0.0))
+
+    if status_text == "skipped_mvp_phase3":
+        return CheckResult(
+            "Window control", "NOT_SCORED", 0,
+            "window processing is intentionally disabled in Phase A",
+        )
 
     if status_text in {"no_windows", "skipped_global_safe"} and window_percent < 0.2:
         return CheckResult("Window control", "PASS", 95, "no meaningful window area")
@@ -146,14 +134,15 @@ def build_checklist(
         score_sharpness_and_output(export_log),
     ]
 
-    scores = [check.score for check in checks]
+    scored_checks = [check for check in checks if check.status != "NOT_SCORED"]
+    scores = [check.score for check in scored_checks]
     # Conservative: weak areas matter more than a simple average.
     overall = _clamp_score(0.65 * min(scores) + 0.35 * (sum(scores) / len(scores)))
 
     automatic_review = (
         route == "GLOBAL_SAFE"
         or quality.get("status") == "REVIEW"
-        or any(check.status == "REVIEW" for check in checks)
+        or any(check.status == "REVIEW" for check in scored_checks)
         or overall < 80
     )
 

@@ -14,19 +14,18 @@ class ExposureFusionConfig:
     max_bright_ev: float = 1.20
     max_dark_ev: float = 0.70
     shadow_anchor_start: float = 0.025
-    shadow_anchor_end: float = 0.11
+    shadow_anchor_end: float = 0.16
     highlight_guard_start: float = 0.72
     highlight_guard_end: float = 0.96
     contrast_weight: float = 1.0
     saturation_weight: float = 0.35
     exposure_weight: float = 1.0
     final_strength: float = 0.86
-    local_contrast_strength: float = 0.10
+    # Mertens already supplies the tonal shaping for the MVP.  Keep the
+    # optional CLAHE hook disabled so contrast is not stacked by default.
+    local_contrast_strength: float = 0.0
     local_contrast_clip_limit: float = 1.6
     local_contrast_grid: int = 8
-    floor_target_median: float = 0.42
-    floor_max_lift: float = 0.18
-    floor_recovery_strength: float = 0.90
 
 
 @dataclass(frozen=True)
@@ -106,12 +105,9 @@ def adaptive_exposure_config(
     y = _luminance_float(f)
     room_median = median
     room_p25 = p25
-    floor_median = None
-    floor_coverage = 0.0
     if scene is not None:
         structure = scene.masks.get("structure")
         window = scene.masks.get("window")
-        floor = scene.masks.get("floor")
         if structure is not None:
             valid = structure > 0.45
             if window is not None:
@@ -121,20 +117,14 @@ def adaptive_exposure_config(
             if values.size >= 512:
                 room_median = float(np.median(values))
                 room_p25 = float(np.percentile(values, 25.0))
-        if floor is not None:
-            floor_valid = (floor > 0.50) & (y > 0.015) & (y < 0.90)
-            floor_values = y[floor_valid]
-            floor_coverage = float(np.mean(floor > 0.50) * 100.0)
-            if floor_values.size >= 256:
-                floor_median = float(np.median(floor_values))
 
     if room_median < 0.27 or room_p25 < 0.12:
         profile = "dark_interior"
         defaults = {
             "target_median": 0.59,
-            "max_bright_ev": 1.70,
+            "max_bright_ev": 1.35,
             "final_strength": 0.98,
-            "local_contrast_strength": 0.10,
+            "local_contrast_strength": 0.0,
         }
     elif room_median < 0.40 or room_p25 < 0.20:
         profile = "dim_interior"
@@ -142,7 +132,7 @@ def adaptive_exposure_config(
             "target_median": 0.56,
             "max_bright_ev": 1.50,
             "final_strength": 0.95,
-            "local_contrast_strength": 0.09,
+            "local_contrast_strength": 0.0,
         }
     else:
         profile = "balanced_interior"
@@ -150,15 +140,8 @@ def adaptive_exposure_config(
             "target_median": 0.52,
             "max_bright_ev": 1.15,
             "final_strength": 0.84,
-            "local_contrast_strength": 0.07,
+            "local_contrast_strength": 0.0,
         }
-
-    # A visibly dark floor is a strong signal that the MLS interior still
-    # needs more opening, but cap the adjustment so bright rooms stay natural.
-    if floor_median is not None and floor_coverage >= 2.0:
-        floor_deficit = max(0.0, 0.34 - floor_median)
-        defaults["target_median"] = min(0.61, defaults["target_median"] + min(0.035, floor_deficit * 0.18))
-        defaults["final_strength"] = min(0.99, defaults["final_strength"] + min(0.025, floor_deficit * 0.12))
 
     defaults.update(base)
     cfg = ExposureFusionConfig(**defaults)
@@ -169,8 +152,6 @@ def adaptive_exposure_config(
         "input_p25": p25,
         "room_median": room_median,
         "room_p25": room_p25,
-        "floor_median": floor_median,
-        "floor_coverage_pct": floor_coverage,
         "input_shadow_clip_pct": shadow_clip,
         "input_highlight_clip_pct": highlight_clip,
     }
@@ -304,62 +285,166 @@ def _gentle_luminance_contrast(
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
 
 
-
-def recover_floor_shadows(
-    reference: np.ndarray,
-    corrected: np.ndarray,
-    scene,
-    config: ExposureFusionConfig,
+def _bounded_room_luminance_correction(
+    rgb: np.ndarray,
+    target_median: float = 0.50,
+    max_ev: float = 0.65,
 ) -> tuple[np.ndarray, dict]:
-    """Open dark floor detail in LAB luminance without changing floor hue."""
-    if scene is None or "floor" not in scene.masks:
-        return corrected.copy(), {"applied": False, "reason": "no_floor_mask"}
+    """Apply one smooth room-wide lift while holding blacks and highlights.
 
-    floor = np.clip(scene.masks["floor"].astype(np.float32), 0.0, 1.0)
-    confident = floor > 0.50
-    if np.count_nonzero(confident) < 256:
-        return corrected.copy(), {"applied": False, "reason": "insufficient_floor_pixels"}
-
-    ref_f = reference.astype(np.float32) / 255.0
-    ref_y = _luminance_float(ref_f)
-    floor_values = ref_y[confident & (ref_y > 0.015) & (ref_y < 0.90)]
-    if floor_values.size < 256:
-        return corrected.copy(), {"applied": False, "reason": "invalid_floor_pixels"}
-
-    floor_median = float(np.median(floor_values))
-    requested = max(0.0, float(config.floor_target_median) - floor_median)
-    lift = min(float(config.floor_max_lift), requested)
-    if lift < 0.008:
-        return corrected.copy(), {
+    The gain is a single scalar derived from the robust image median.  Only
+    its luminance contribution is retained, so photographed hue and saturation
+    remain unchanged.  There are no semantic or per-pixel darkness targets.
+    """
+    f = rgb.astype(np.float32) / 255.0
+    y = _luminance_float(f)
+    valid = y[(y > 0.02) & (y < 0.92)]
+    median = float(np.median(valid)) if valid.size >= 256 else float(np.median(y))
+    required_ev = float(np.log2(max(target_median, 1e-4) / max(median, 1e-4)))
+    # In extremely dark rooms a large scalar lift makes naturally reflective
+    # wood look pale before the black walls become midtone. Keep the same
+    # global curve, but tighten its room-wide cap smoothly for that case.
+    scene_cap = 0.25 if median < 0.36 else max_ev
+    applied_ev = float(np.clip(required_ev, 0.0, scene_cap))
+    if applied_ev < 0.01:
+        return rgb.copy(), {
             "applied": False,
-            "reason": "floor_already_bright",
-            "input_floor_median": floor_median,
+            "input_median": median,
+            "target_median": target_median,
+            "applied_ev": 0.0,
         }
 
-    # Feather mask edges while keeping the confident interior effective.
-    sigma = max(2.0, min(reference.shape[:2]) / 180.0)
-    feather = cv2.GaussianBlur(floor, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    feather = np.clip(feather, 0.0, 1.0)
-    visibility = _smoothstep(0.025, 0.13, ref_y)
-    # Darker floor pixels receive more recovery, but photographed black remains anchored.
-    darkness = 1.0 - _smoothstep(floor_median, min(0.70, floor_median + 0.30), ref_y)
-    amount = float(config.floor_recovery_strength) * feather * visibility * (0.45 + 0.55 * darkness)
+    gain = float(2.0**applied_ev)
+    black_anchor = _smoothstep(0.018, 0.18, y)
+    highlight_guard = 1.0 - _smoothstep(0.58, 0.90, y)
+    local_gain = 1.0 + (gain - 1.0) * black_anchor * highlight_guard
+    lifted = _ratio_preserving_shoulder(f * local_gain[..., None])
+    lifted_u8 = np.clip(lifted * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
-    lab = cv2.cvtColor(corrected, cv2.COLOR_RGB2LAB).astype(np.float32)
-    current_l = lab[..., 0] / 255.0
-    target_l = np.minimum(1.0, current_l + lift)
-    lab[..., 0] = 255.0 * (current_l * (1.0 - amount) + target_l * amount)
-    out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
-    out_y = _luminance_float(out.astype(np.float32) / 255.0)
+    # Keep only the corrected luminance. This is a chroma lock, not a color
+    # correction: the incoming WB hue/saturation is copied unchanged.
+    src_lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    dst_lab = cv2.cvtColor(lifted_u8, cv2.COLOR_RGB2LAB)
+    dst_lab[..., 1:3] = src_lab[..., 1:3]
+    out = cv2.cvtColor(dst_lab, cv2.COLOR_LAB2RGB)
     return out, {
         "applied": True,
-        "input_floor_median": floor_median,
-        "output_floor_median": float(np.median(out_y[confident])),
-        "requested_lift": requested,
-        "applied_lift_cap": lift,
-        "floor_target_median": float(config.floor_target_median),
-        "floor_coverage_pct": float(np.mean(confident) * 100.0),
+        "input_median": median,
+        "target_median": target_median,
+        "requested_ev": required_ev,
+        "applied_ev": applied_ev,
+        "scene_cap_ev": scene_cap,
     }
+
+
+def _lock_chroma_to_reference(reference: np.ndarray, luminance_source: np.ndarray) -> np.ndarray:
+    """Take luminance from the correction and exact Lab chroma from WB input."""
+    src = cv2.cvtColor(reference, cv2.COLOR_RGB2LAB)
+    dst = cv2.cvtColor(luminance_source, cv2.COLOR_RGB2LAB)
+    dst[..., 1:3] = src[..., 1:3]
+    return cv2.cvtColor(dst, cv2.COLOR_LAB2RGB)
+
+
+def _scene_wide_exposure_plan(
+    rgb: np.ndarray,
+    scene,
+    cfg: ExposureFusionConfig,
+) -> tuple[float, dict]:
+    """Estimate one MLS exposure value from scene-wide measurements."""
+    f = rgb.astype(np.float32) / 255.0
+    y = _luminance_float(f)
+    h, w = y.shape
+    structure = None if scene is None else scene.masks.get("structure")
+    window = None if scene is None else scene.masks.get("window")
+    room = np.ones((h, w), dtype=bool) if structure is None else structure > 0.45
+    if window is not None:
+        room &= window < 0.25
+    room &= (y > 0.015) & (y < 0.95)
+    if np.count_nonzero(room) < 512:
+        room = (y > 0.015) & (y < 0.95)
+
+    values = y[room]
+    median = float(np.median(values))
+    p25 = float(np.percentile(values, 25))
+    p75 = float(np.percentile(values, 75))
+    shadow_pct = float(np.mean(values < 0.18) * 100.0)
+    black_pct = float(np.mean(values < 0.035) * 100.0)
+
+    def semantic_median(name: str) -> float | None:
+        if scene is None or name not in scene.masks:
+            return None
+        valid = (scene.masks[name] > 0.55) & (y > 0.015) & (y < 0.95)
+        return float(np.median(y[valid])) if np.count_nonzero(valid) >= 256 else None
+
+    ceiling_median = semantic_median("ceiling")
+    wall_median = semantic_median("wall")
+    window_area = float(np.mean(window > 0.5) * 100.0) if window is not None else 0.0
+    window_values = y[window > 0.5] if window is not None and np.any(window > 0.5) else np.array([])
+    window_median = float(np.median(window_values)) if window_values.size else None
+    highlight_pct = float(np.mean(y > 0.985) * 100.0)
+
+    dark_decor = bool(
+        wall_median is not None
+        and ceiling_median is not None
+        and wall_median < 0.42 * max(ceiling_median, 1e-4)
+    )
+    if dark_decor:
+        target = 0.42
+        max_ev = 0.65
+        profile = "dark_decor"
+    elif median < 0.28 or shadow_pct > 32.0:
+        target = 0.50 if window_area >= 0.3 else 0.52
+        max_ev = 0.75
+        profile = "underexposed_room"
+    elif median < 0.42:
+        target = 0.50
+        max_ev = 0.65
+        profile = "dim_room"
+    else:
+        target = 0.50
+        max_ev = 0.35
+        profile = "balanced_room"
+
+    required_ev = float(np.log2(max(target, 1e-4) / max(median, 1e-4)))
+    applied_ev = float(np.clip(required_ev, 0.0, max_ev))
+    return applied_ev, {
+        "profile": profile,
+        "room_median": median,
+        "room_p25": p25,
+        "room_p75": p75,
+        "shadow_percent": shadow_pct,
+        "black_percent": black_pct,
+        "ceiling_median": ceiling_median,
+        "wall_median": wall_median,
+        "window_area_percent": window_area,
+        "window_median": window_median,
+        "highlight_clip_percent": highlight_pct,
+        "dark_decor": dark_decor,
+        "target_median": target,
+        "required_ev": required_ev,
+        "applied_ev": applied_ev,
+        "maximum_ev": max_ev,
+    }
+
+
+def _apply_scene_wide_exposure(
+    rgb: np.ndarray,
+    ev: float,
+    cfg: ExposureFusionConfig,
+) -> np.ndarray:
+    """Apply the single planned exposure with smooth endpoint protection."""
+    if ev <= 0.001:
+        return rgb.copy()
+    f = rgb.astype(np.float32) / 255.0
+    y = _luminance_float(f)
+    black_anchor = _smoothstep(cfg.shadow_anchor_start, cfg.shadow_anchor_end, y)
+    highlight_guard = 1.0 - _smoothstep(cfg.highlight_guard_start, cfg.highlight_guard_end, y)
+    gain = float(2.0**ev)
+    local_gain = 1.0 + (gain - 1.0) * black_anchor * highlight_guard
+    out = _ratio_preserving_shoulder(f * local_gain[..., None])
+    return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
 
 def exposure_fusion(
     rgb: np.ndarray,
@@ -381,45 +466,36 @@ def exposure_fusion(
         cfg = config
         _, adaptive_log = adaptive_exposure_config(rgb, adaptive_settings, scene)
         adaptive_log["adaptive_profile"] = "explicit_config"
-    exposures, plan = generate_virtual_exposures(rgb, cfg)
-
-    merger = cv2.createMergeMertens(
-        contrast_weight=float(cfg.contrast_weight),
-        saturation_weight=float(cfg.saturation_weight),
-        exposure_weight=float(cfg.exposure_weight),
-    )
-    # OpenCV accepts uint8 BGR/RGB arrays equally for weight computation; all
-    # channels are treated symmetrically. Output is float32 in approximately
-    # [0, 1], though tiny excursions are possible.
-    fused_float = merger.process(exposures)
-    fused = np.clip(fused_float, 0.0, 1.0)
-    fused_u8 = np.clip(fused * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    output = _blend_with_original(rgb, fused_u8, cfg)
-    output = _gentle_luminance_contrast(output, rgb, cfg)
-    output, floor_log = recover_floor_shadows(rgb, output, scene, cfg)
+    applied_ev, scene_plan = _scene_wide_exposure_plan(rgb, scene, cfg)
+    output = _apply_scene_wide_exposure(rgb, applied_ev, cfg)
 
     out_median, out_mean, out_p25, out_shadow_clip, out_highlight_clip = _robust_luminance_stats(output)
+    input_median, input_mean, input_p25, input_shadow_clip, input_highlight_clip = _robust_luminance_stats(rgb)
     metrics = ExposureMetrics(
-        input_median=plan["input_median"],
+        input_median=input_median,
         output_median=out_median,
-        input_mean=plan["input_mean"],
+        input_mean=input_mean,
         output_mean=out_mean,
-        input_shadow_clip_pct=plan["input_shadow_clip_pct"],
+        input_shadow_clip_pct=input_shadow_clip,
         output_shadow_clip_pct=out_shadow_clip,
-        input_highlight_clip_pct=plan["input_highlight_clip_pct"],
+        input_highlight_clip_pct=input_highlight_clip,
         output_highlight_clip_pct=out_highlight_clip,
-        bright_ev=plan["bright_ev"],
-        dark_ev=plan["dark_ev"],
-        virtual_exposure_count=len(exposures),
-        input_p25=plan["input_p25"],
+        bright_ev=applied_ev,
+        dark_ev=0.0,
+        virtual_exposure_count=1,
+        input_p25=input_p25,
         adaptive_profile=adaptive_log["adaptive_profile"],
     )
 
     return output, {
-        "engine": "scene_aware_mertens_exposure_fusion_v3",
+        "engine": "scene_wide_mls_luminance_v1",
         "metrics": asdict(metrics),
         "config": asdict(cfg),
         "adaptive": adaptive_log,
+        "scene_exposure_plan": scene_plan,
         "output_p25": out_p25,
-        "floor_recovery": floor_log,
+        "floor_recovery": {
+            "applied": False,
+            "reason": "removed_from_mvp_phase_a",
+        },
     }

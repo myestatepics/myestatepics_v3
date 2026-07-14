@@ -29,7 +29,8 @@ def test_mvp_core_runs_single_wb_then_exposure_fusion():
 
     assert result["protected"].shape == image.shape
     assert result["protected"].dtype == np.uint8
-    assert result["exposure_log"]["engine"] == "scene_aware_mertens_exposure_fusion_v3"
+    assert result["exposure_log"]["engine"] == "scene_wide_mls_luminance_v1"
+    assert result["exposure_log"]["floor_recovery"]["applied"] is False
     assert result["window_log"]["status"] == "skipped_mvp_phase3"
     assert "gains" in result["wb_log"]
 
@@ -43,5 +44,6 @@ def test_mvp_material_guardrail_uses_wb_corrected_reference():
 
     # The guardrail is active, but cannot undo the white-balance pass because
     # its source is the WB-corrected image rather than the raw input.
-    assert result["materials_log"]["floor_included"] is True
+    assert result["materials_log"]["floor_included"] is False
+    assert result["materials_log"]["floor_mode"] == "global_luminance_only_no_local_guardrail"
     assert result["wb"].shape == result["protected"].shape

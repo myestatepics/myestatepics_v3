@@ -9,7 +9,7 @@ from .materials2 import apply_material_guardrails
 from .profiles import detect_room_profile
 from .tone_classify import classify_tones
 from .utils import analyze_image
-from .wb import conservative_white_balance
+from .wb import conservative_white_balance, gentle_wall_chroma_consistency
 
 
 def process_mvp_core(
@@ -24,7 +24,9 @@ def process_mvp_core(
     semantic masks only to protect photographed material chroma.
     """
     tone_settings = settings.get("targets", {})
-    wb, wb_log = conservative_white_balance(original, scene)
+    wb_global, wb_log = conservative_white_balance(original, scene)
+    wb, wall_consistency_log = gentle_wall_chroma_consistency(wb_global, scene)
+    wb_log = {**wb_log, "wall_chroma_consistency": wall_consistency_log}
 
     profile_name, profile_targets, profile_dynamics = detect_room_profile(scene, wb)
     tone_settings = {**tone_settings, **profile_targets}

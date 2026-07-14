@@ -13,10 +13,9 @@ def test_good_checklist_passes():
         quality={
             "status": "PASS",
             "flags": [],
-            "achieved_targets": {
-                "wall": {"target": 0.60, "after": 0.59},
-                "ceiling": {"target": 0.78, "after": 0.76},
-            },
+            "global_median_brightness_after": 0.55,
+            "highlight_clipped_percent_excluding_windows": 0.2,
+            "shadow_clipped_percent_excluding_windows": 0.2,
             "protected_chroma_p95_delta": 3.0,
             "protected_chroma_mean_delta": 1.0,
             "clipped_percent_after_excluding_windows": 0.2,
@@ -39,7 +38,9 @@ def test_global_safe_always_review():
         quality={
             "status": "PASS",
             "flags": [],
-            "achieved_targets": {"wall": {"target": 0.5, "after": 0.5}},
+            "global_median_brightness_after": 0.5,
+            "highlight_clipped_percent_excluding_windows": 0.0,
+            "shadow_clipped_percent_excluding_windows": 0.0,
             "protected_chroma_p95_delta": 1.0,
             "protected_chroma_mean_delta": 0.5,
             "clipped_percent_after_excluding_windows": 0.0,
@@ -71,3 +72,24 @@ def test_batch_summary():
     assert summary["pass_count"] == 1
     assert summary["review_count"] == 1
     assert summary["overall_engine_score"] == 80
+
+
+def test_skipped_mvp_windows_are_not_scored():
+    checklist = build_checklist(
+        wb_log={"gains": [1.0, 1.0, 1.0], "confidence": "HIGH"},
+        window_log={"status": "skipped_mvp_phase3"},
+        quality={
+            "status": "PASS",
+            "flags": [],
+            "global_median_brightness_after": 0.52,
+            "highlight_clipped_percent_excluding_windows": 0.0,
+            "shadow_clipped_percent_excluding_windows": 0.0,
+            "protected_chroma_p95_delta": 1.0,
+            "protected_chroma_mean_delta": 0.5,
+        },
+        export_log={"resolution_preserved": True, "oversized": False, "quality": 95},
+        route="SEMANTIC",
+    )
+    window = next(c for c in checklist["checks"] if c["name"] == "Window control")
+    assert window["status"] == "NOT_SCORED"
+    assert window["score"] == 0

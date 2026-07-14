@@ -124,12 +124,11 @@ def _reference_choice(
             count = int(np.count_nonzero(valid))
             coverage = float(scene.coverage.get("ceiling", 0.0))
             if count >= config.minimum_reference_pixels and coverage >= 3.0:
-                confidence = (
-                    "HIGH"
-                    if agreement is not None and agreement <= config.half_agreement_limit
-                    else "MEDIUM"
-                )
-                return valid, "ceiling", confidence, agreement
+                # A ceiling whose two halves imply materially different gains
+                # is mixed-lit (often warm fixtures versus window light), not
+                # a trustworthy global neutral reference.
+                if agreement is not None and agreement <= config.half_agreement_limit:
+                    return valid, "ceiling", "HIGH", agreement
 
         wall = scene.masks.get("wall")
         if wall is not None:
@@ -137,7 +136,10 @@ def _reference_choice(
             upper_wall[int(h * 0.45) :] = 0.0
             valid = _candidate_pixels(rgb, upper_wall)
             agreement = _half_agreement(linear, valid, config.minimum_half_pixels)
-            if int(np.count_nonzero(valid)) >= config.minimum_reference_pixels:
+            if (
+                int(np.count_nonzero(valid)) >= config.minimum_reference_pixels
+                and (agreement is None or agreement <= config.half_agreement_limit * 1.35)
+            ):
                 return valid, "upper_wall", "MEDIUM", agreement
 
         structure = scene.masks.get("structure")
@@ -222,6 +224,68 @@ def conservative_white_balance(
         "raw_gains": [float(x) for x in raw],
         "gains": [float(x) for x in gains],
         "gain_limit": float(limit),
+    }
+
+
+def gentle_wall_chroma_consistency(
+    rgb: np.ndarray,
+    scene: Scene,
+    *,
+    strength: float = 0.28,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Reduce verified mixed-light chroma divergence on neutral wall paint.
+
+    Luminance is never changed. The already-feathered wall confidence and a
+    broad weighted color field prevent hard edges; naturally colored walls
+    are excluded so accent paint is not neutralized.
+    """
+    wall = scene.masks.get("wall")
+    if wall is None or np.count_nonzero(wall > 0.5) < 2400:
+        return rgb.copy(), {"applied": False, "reason": "insufficient_wall"}
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    l = lab[..., 0] / 255.0
+    ab = lab[..., 1:3] - 128.0
+    chroma = np.sqrt(np.sum(ab * ab, axis=2))
+    valid = (wall > 0.55) & (l > 0.15) & (l < 0.92) & (chroma < 22.0)
+    if np.count_nonzero(valid) < 2400:
+        return rgb.copy(), {"applied": False, "reason": "no_neutral_wall_family"}
+
+    target = np.median(ab[valid], axis=0).astype(np.float32)
+    weight = np.clip(wall, 0.0, 1.0) * valid.astype(np.float32)
+    h, w = wall.shape
+    scale = min(1.0, 640.0 / max(h, w))
+    sw, sh = max(1, round(w * scale)), max(1, round(h * scale))
+    small_weight = cv2.resize(weight, (sw, sh), interpolation=cv2.INTER_AREA)
+    small_ab = cv2.resize(ab, (sw, sh), interpolation=cv2.INTER_AREA)
+    sigma = max(12.0, max(sh, sw) / 9.0)
+    denominator = cv2.GaussianBlur(small_weight, (0, 0), sigma) + 1e-5
+    local_a = cv2.GaussianBlur(small_ab[..., 0] * small_weight, (0, 0), sigma) / denominator
+    local_b = cv2.GaussianBlur(small_ab[..., 1] * small_weight, (0, 0), sigma) / denominator
+    local_small = np.stack([local_a, local_b], axis=2)
+    local = cv2.resize(local_small, (w, h), interpolation=cv2.INTER_LINEAR)
+    divergence = np.sqrt(np.sum((local - target[None, None, :]) ** 2, axis=2))
+    p90 = float(np.percentile(divergence[valid], 90))
+    if p90 < 3.0:
+        return rgb.copy(), {
+            "applied": False,
+            "reason": "wall_chroma_consistent",
+            "divergence_p90": p90,
+        }
+
+    gate = np.clip((divergence - 2.0) / 7.0, 0.0, 1.0)
+    gate = gate * gate * (3.0 - 2.0 * gate)
+    adaptive_strength = min(0.42, strength + max(0.0, p90 - 4.0) * 0.020)
+    amount = adaptive_strength * np.clip(wall, 0.0, 1.0) * gate * valid.astype(np.float32)
+    corrected_ab = ab - (local - target[None, None, :]) * amount[..., None]
+    lab[..., 1:3] = corrected_ab + 128.0
+    out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    return out, {
+        "applied": True,
+        "strength": adaptive_strength,
+        "divergence_p90": p90,
+        "target_ab": [float(target[0]), float(target[1])],
+        "affected_percent": float(np.mean(amount > 0.01) * 100.0),
     }
 
 

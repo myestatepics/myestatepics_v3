@@ -57,9 +57,7 @@
     "dark_wall_max_lift": 0.055,
     "dark_material_max_lift": 0.075,
     "chroma_restore_strength": 0.5,
-    "floor_chroma_restore_strength": 0.62,
-    "ceiling_chroma_limit": 3.0,
-    "floor_max_lift": 0.2
+    "ceiling_chroma_limit": 3.0
   },
   "quality_validation": {
     "highlight_clip_percent": 1.8,
@@ -72,21 +70,27 @@
     "material_saturation_p95": 0.16,
     "floor_luminance_shift": 0.18,
     "wall_uniformity_increase": 0.08,
-    "residual_cast": 5.0
+    "residual_cast": 5.0,
+    "input_material_chroma_p95": 14.0,
+    "floor_blotch_p95": 0.045,
+    "mask_boundary_gradient_p95": 1.0,
+    "local_contrast_discontinuity_p99": 0.34,
+    "texture_retention_min": 0.72,
+    "texture_amplification_max": 2.2,
+    "wall_chroma_divergence_p90": 7.0,
+    "ceiling_warmth_b_median": 8.0
   },
   "adaptive_exposure": {
     "max_dark_ev": 0.65,
-    "highlight_guard_start": 0.7,
-    "highlight_guard_end": 0.95,
+    "highlight_guard_start": 0.52,
+    "highlight_guard_end": 0.9,
     "shadow_anchor_start": 0.02,
-    "shadow_anchor_end": 0.1,
-    "contrast_weight": 1.0,
+    "shadow_anchor_end": 0.16,
+    "contrast_weight": 0.35,
     "saturation_weight": 0.25,
     "exposure_weight": 1.0,
+    "local_contrast_strength": 0.0,
     "local_contrast_clip_limit": 1.5,
-    "local_contrast_grid": 8,
-    "floor_target_median": 0.42,
-    "floor_max_lift": 0.18,
-    "floor_recovery_strength": 0.9
+    "local_contrast_grid": 8
   }
 }

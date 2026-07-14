@@ -46,9 +46,7 @@ def apply_material_guardrails(
     cfg = (settings or {}).get("material_guardrails", settings or {})
     dark_wall_max_lift = float(cfg.get("dark_wall_max_lift", 0.055))
     dark_material_max_lift = float(cfg.get("dark_material_max_lift", 0.075))
-    floor_max_lift = float(cfg.get("floor_max_lift", 0.20))
     chroma_restore = float(cfg.get("chroma_restore_strength", 0.50))
-    floor_restore = float(cfg.get("floor_chroma_restore_strength", 0.62))
     ceiling_chroma_limit = float(cfg.get("ceiling_chroma_limit", 3.0))
 
     h, w = reference.shape[:2]
@@ -69,17 +67,20 @@ def apply_material_guardrails(
     wall_hold = wall * very_dark
     nonfloor_material = np.maximum.reduce([cabinet, furnishings, protected])
     material_hold = nonfloor_material * dark
-    floor_hold = floor * dark
+    # Floors follow the global room exposure. There is deliberately no
+    # floor-specific luminance cap, ratio cap, or chroma re-anchoring.
+    floor_hold = np.zeros_like(floor)
 
     active_hold = np.maximum.reduce([wall_hold, material_hold, floor_hold])
     lift_limit = np.full(shape, dark_material_max_lift, dtype=np.float32)
-    lift_limit = np.where(wall_hold >= np.maximum(material_hold, floor_hold), dark_wall_max_lift, lift_limit)
-    lift_limit = np.where(floor_hold > np.maximum(wall_hold, material_hold), floor_max_lift, lift_limit)
+    lift_limit = lift_limit * (1.0 - wall_hold) + dark_wall_max_lift * wall_hold
     allowed = ref_y + lift_limit
     excess = np.maximum(out_y - allowed, 0.0)
     # Semantic masks are already edge-refined. Apply the limit fully in the
     # confident interior of a mask and feather only uncertain boundary pixels.
-    hold_strength = np.where(active_hold >= 0.50, 1.0, active_hold * 2.0)
+    # Keep the hold continuous through mask confidence.  The previous branch
+    # snapped to full strength at 0.5 and could print a hard semantic edge.
+    hold_strength = _smoothstep(0.05, 0.55, active_hold)
     target_y = out_y - excess * hold_strength
 
     corrected_f = corrected.astype(np.float32) / 255.0
@@ -95,7 +96,6 @@ def apply_material_guardrails(
     visible_guard = _smoothstep(0.045, 0.12, ref_y)
     base_restore_mask = np.maximum.reduce([protected, cabinet, furnishings])
     restore_strength = chroma_restore * base_restore_mask * visible_guard
-    restore_strength = np.maximum(restore_strength, floor_restore * floor * visible_guard)
     dst_lab[..., 1:3] = (
         dst_lab[..., 1:3] * (1.0 - restore_strength[..., None])
         + src_lab[..., 1:3] * restore_strength[..., None]
@@ -120,16 +120,15 @@ def apply_material_guardrails(
         "engine": "material_dark_surface_guardrails_v2",
         "dark_wall_max_lift": dark_wall_max_lift,
         "dark_material_max_lift": dark_material_max_lift,
-        "floor_max_lift": floor_max_lift,
         "chroma_restore_strength": chroma_restore,
-        "floor_chroma_restore_strength": floor_restore,
         "held_area_percent": float(np.mean(held) * 100.0),
         "mean_luminance_reduction_held": float(np.mean(excess[held])) if np.any(held) else 0.0,
         "max_luminance_reduction": float(np.max(excess * active_hold)),
         "mean_chroma_adjustment": float(np.mean(chroma_delta[restore_strength > 0.05]))
         if np.any(restore_strength > 0.05) else 0.0,
         "neutral_ceiling_percent": float(np.mean(neutral_ceiling > 0.5) * 100.0),
-        "floor_included": True,
+        "floor_included": False,
+        "floor_mode": "global_luminance_only_no_local_guardrail",
     }
 
 

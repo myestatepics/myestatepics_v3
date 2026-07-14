@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 
 from engine.exposure_fusion import adaptive_exposure_config, exposure_fusion
@@ -22,11 +23,10 @@ def test_balanced_room_stays_conservative():
 def test_local_contrast_does_not_shift_uniform_warm_hue():
     rgb = np.full((120, 160, 3), [100, 65, 38], dtype=np.uint8)
     out, log = exposure_fusion(rgb)
-    before = rgb.astype(np.float32).mean(axis=(0, 1))
-    after = out.astype(np.float32).mean(axis=(0, 1))
-    before_ratio = before / before.sum()
-    after_ratio = after / after.sum()
-    assert np.max(np.abs(before_ratio - after_ratio)) < 0.035
+    before = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    after = cv2.cvtColor(out, cv2.COLOR_RGB2HSV).astype(np.float32)
+    assert np.max(np.abs(before[..., 0] - after[..., 0])) <= 1.0
+    assert np.max(np.abs(before[..., 1] - after[..., 1])) <= 2.0
     assert log["adaptive"]["adaptive_profile"] in {"dim_interior", "balanced_interior"}
 
 

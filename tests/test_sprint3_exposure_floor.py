@@ -31,22 +31,25 @@ def test_scene_target_ignores_bright_window_and_raises_dark_room_target():
     assert cfg.target_median >= 0.58
 
 
-def test_floor_recovery_opens_dark_wood_without_large_hue_shift():
+def test_floor_recovery_is_removed_and_dark_wood_hue_stays_stable():
     h, w = 180, 240
     rgb = np.full((h, w, 3), [92, 88, 82], np.uint8)
     rgb[2 * h // 3 :] = [55, 34, 20]
     scene = _scene(h, w)
     out, log = exposure_fusion(rgb, scene=scene)
     floor = scene.masks["floor"] > 0.5
-    assert np.median(_luma(out)[floor]) > np.median(_luma(rgb)[floor]) + 0.08
-    assert log["floor_recovery"]["applied"] is True
+    # The floor may receive the same global exposure correction as the room,
+    # but it must not receive the retired darkness-weighted local lift.
+    assert log["floor_recovery"]["applied"] is False
+    assert log["floor_recovery"]["reason"] == "removed_from_mvp_phase_a"
+    assert np.median(_luma(out)[floor]) - np.median(_luma(rgb)[floor]) < 0.08
     before = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(float)
     after = cv2.cvtColor(out, cv2.COLOR_RGB2LAB).astype(float)
     chroma_shift = np.median(np.linalg.norm(after[floor, 1:3] - before[floor, 1:3], axis=1))
     assert chroma_shift < 8.0
 
 
-def test_material_guardrail_allows_floor_recovery_but_holds_dark_wall():
+def test_material_guardrail_holds_dark_wall_but_floor_follows_global_exposure():
     h, w = 180, 240
     ref = np.full((h, w, 3), 55, np.uint8)
     ref[2 * h // 3 :] = [50, 31, 18]
@@ -59,5 +62,4 @@ def test_material_guardrail_allows_floor_recovery_but_holds_dark_wall():
     wall_lift = np.mean(_luma(out)[wall] - _luma(ref)[wall])
     floor_lift = np.mean(_luma(out)[floor] - _luma(ref)[floor])
     assert wall_lift < 0.075
-    assert floor_lift > wall_lift + 0.04
-    assert floor_lift <= 0.22
+    assert floor_lift > 0.12
