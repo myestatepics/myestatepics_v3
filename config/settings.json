@@ -43,7 +43,8 @@
     "create_scored_comparisons": true,
     "create_batch_contact_sheet": true,
     "conservative_final_routing": true,
-    "minimum_final_score": 80
+    "minimum_final_score": 80,
+    "pipeline_mode": "mvp"
   },
   "version": "4.1.0-rc1",
   "phase3": {

@@ -19,9 +19,16 @@ from engine.utils import (
 from engine.refine import refine_masks
 from engine.scene import build_scene
 from engine.tone_classify import classify_tones
-from engine.wb import semantic_white_balance, global_safe_white_balance, global_pass1_wb
+from engine.wb import (
+    conservative_white_balance,
+    semantic_white_balance,
+    global_safe_white_balance,
+    global_pass1_wb,
+)
 from engine.profiles import detect_room_profile
 from engine.tonal import adaptive_per_class_exposure, global_safe_exposure
+from engine.exposure_fusion import exposure_fusion
+from engine.mvp_pipeline import process_mvp_core
 from engine.windows2 import treat_window_zones
 from engine.materials2 import restore_protected_chroma
 from engine.finish import natural_finish
@@ -118,12 +125,20 @@ def load_or_refine(
     return masks, log
 
 
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MyEstatePics Semantic Engine v3 Phase 2")
     parser.add_argument("--project", default=".")
     parser.add_argument("--input", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--pipeline",
+        choices=("mvp", "legacy"),
+        default=None,
+        help="Select the new MVP pipeline or the previous legacy pipeline. "
+             "Defaults to config workflow.pipeline_mode.",
+    )
     parser.add_argument(
         "--debug-stages",
         action="store_true",
@@ -134,6 +149,7 @@ def main() -> int:
     run_started = time.perf_counter()
     project = Path(args.project).expanduser().resolve()
     settings = load_settings(project / "config/settings.json")
+    pipeline_mode = args.pipeline or settings.get("workflow", {}).get("pipeline_mode", "legacy")
     input_root = Path(args.input).expanduser().resolve() if args.input else project / settings["input_folder"]
     images = collect_images(input_root)
     if args.limit is not None:
@@ -166,20 +182,6 @@ def main() -> int:
             scene = build_scene(refined, original.shape[:2])
             tone_settings = settings.get("targets", {})
 
-            # v3.2 Fix 1: two-pass WB. Pass 1 removes the bulk of any global
-            # cast BEFORE reference validation and tone classification, so a
-            # strong cast can no longer disqualify its own best witness (the
-            # ceiling) and a dark room no longer loses its 0.80 ceiling target.
-            pass1, pass1_log = global_pass1_wb(original, scene)
-            profile_name, profile_targets, profile_dynamics = detect_room_profile(scene, pass1)
-            tone_settings = {**tone_settings, **profile_targets}
-            tones, tones_log = classify_tones(pass1, scene, tone_settings)
-            analysis = analyze_image(pass1).to_dict()
-            analysis["furnishing_protection"] = float(tone_settings.get("furnishing_factor", 1.0))
-            analysis["material_inherit_factor"] = float(settings.get("phase3", {}).get("material_inherit_factor", 1.0))
-            analysis.update(profile_dynamics)
-            analysis["room_profile"] = profile_name
-
             debug_recorder = None
             if args.debug_stages:
                 debug_recorder = DebugStageRecorder(
@@ -193,45 +195,90 @@ def main() -> int:
                     original,
                 )
 
-            if scene.route == "SEMANTIC":
-                wb, wb_log = semantic_white_balance(pass1, scene, tones)
-                wb_log = {**pass1_log, **wb_log}
+            if pipeline_mode == "mvp":
+                # Sprint 2 Phase 3: one bounded WB pass followed by global
+                # exposure fusion. Semantic masks are guardrails only; they do
+                # not set exposure targets or locally relight the room.
+                mvp = process_mvp_core(original, scene, settings)
+                wb = mvp["wb"]
+                wb_log = mvp["wb_log"]
+                exposed = mvp["exposed"]
+                exposure_log = mvp["exposure_log"]
+                protected = mvp["protected"]
+                materials_log = mvp["materials_log"]
+                tones = mvp["tones"]
+                tones_log = mvp["tones_log"]
+                analysis = mvp["analysis"]
+                profile_name = mvp["profile_name"]
+                window_log = mvp["window_log"]
+
                 if debug_recorder is not None:
                     debug_recorder.save_stage("01_after_wb", "After white balance", wb)
 
-                exposed, exposure_log = adaptive_per_class_exposure(wb, scene, tones, analysis)
                 if debug_recorder is not None:
-                    debug_recorder.save_stage("02_after_exposure", "After exposure", exposed)
+                    debug_recorder.save_stage("02_after_exposure", "After exposure fusion", exposed)
 
-                windows, window_log = treat_window_zones(exposed, scene)
                 if debug_recorder is not None:
-                    debug_recorder.save_stage("03_after_window", "After window treatment", windows)
-
-                protected, materials_log = restore_protected_chroma(pass1, windows, scene)
-                if debug_recorder is not None:
+                    debug_recorder.save_stage("03_after_window", "Window stage skipped", exposed)
                     debug_recorder.save_stage(
                         "04_after_material_restore",
-                        "After material restoration",
+                        "After material guardrail",
                         protected,
                     )
+                quality_reference = wb
             else:
-                wb, wb_log = global_safe_white_balance(original)
-                wb_log = {**pass1_log, **wb_log}
-                if debug_recorder is not None:
-                    debug_recorder.save_stage("01_after_wb", "After white balance", wb)
+                # Previous production path retained intact for rollback and
+                # A/B comparisons via --pipeline legacy.
+                pass1, pass1_log = global_pass1_wb(original, scene)
+                profile_name, profile_targets, profile_dynamics = detect_room_profile(scene, pass1)
+                tone_settings = {**tone_settings, **profile_targets}
+                tones, tones_log = classify_tones(pass1, scene, tone_settings)
+                analysis = analyze_image(pass1).to_dict()
+                analysis["furnishing_protection"] = float(tone_settings.get("furnishing_factor", 1.0))
+                analysis["material_inherit_factor"] = float(settings.get("phase3", {}).get("material_inherit_factor", 1.0))
+                analysis.update(profile_dynamics)
+                analysis["room_profile"] = profile_name
 
-                protected, exposure_log = global_safe_exposure(wb, analysis)
-                if debug_recorder is not None:
-                    debug_recorder.save_stage("02_after_exposure", "After exposure", protected)
-                    debug_recorder.save_stage("03_after_window", "After window treatment", protected)
-                    debug_recorder.save_stage(
-                        "04_after_material_restore",
-                        "After material restoration",
-                        protected,
-                    )
+                if scene.route == "SEMANTIC":
+                    wb, wb_log = semantic_white_balance(pass1, scene, tones)
+                    wb_log = {**pass1_log, **wb_log}
+                    if debug_recorder is not None:
+                        debug_recorder.save_stage("01_after_wb", "After white balance", wb)
 
-                window_log = {"status": "skipped_global_safe"}
-                materials_log = {"status": "skipped_global_safe"}
+                    exposed, exposure_log = adaptive_per_class_exposure(wb, scene, tones, analysis)
+                    if debug_recorder is not None:
+                        debug_recorder.save_stage("02_after_exposure", "After exposure", exposed)
+
+                    windows, window_log = treat_window_zones(exposed, scene)
+                    if debug_recorder is not None:
+                        debug_recorder.save_stage("03_after_window", "After window treatment", windows)
+
+                    protected, materials_log = restore_protected_chroma(pass1, windows, scene)
+                    if debug_recorder is not None:
+                        debug_recorder.save_stage(
+                            "04_after_material_restore",
+                            "After material restoration",
+                            protected,
+                        )
+                else:
+                    wb, wb_log = global_safe_white_balance(original)
+                    wb_log = {**pass1_log, **wb_log}
+                    if debug_recorder is not None:
+                        debug_recorder.save_stage("01_after_wb", "After white balance", wb)
+
+                    protected, exposure_log = global_safe_exposure(wb, analysis)
+                    if debug_recorder is not None:
+                        debug_recorder.save_stage("02_after_exposure", "After exposure", protected)
+                        debug_recorder.save_stage("03_after_window", "After window treatment", protected)
+                        debug_recorder.save_stage(
+                            "04_after_material_restore",
+                            "After material restoration",
+                            protected,
+                        )
+
+                    window_log = {"status": "skipped_global_safe"}
+                    materials_log = {"status": "skipped_global_safe"}
+                quality_reference = pass1
 
             final, finish_log = natural_finish(protected)
             if debug_recorder is not None:
@@ -240,7 +287,7 @@ def main() -> int:
             if final.shape[:2] != original_shape:
                 raise RuntimeError(f"Resolution changed: {original_shape} -> {final.shape[:2]}")
 
-            quality = evaluate(pass1, final, scene, tones)
+            quality = evaluate(quality_reference, final, scene, tones)
 
             # Save temporarily so output-quality checks can inspect the actual export settings.
             provisional_path = project / "output/review" / path.name
@@ -289,6 +336,7 @@ def main() -> int:
 
             report = {
                 "filename": path.name,
+                "pipeline_mode": pipeline_mode,
                 "route": scene.route,
                 "route_reasons": scene.reasons,
                 "segmentation": seg_log,
@@ -297,7 +345,7 @@ def main() -> int:
                 "tones": tones_log,
                 "analysis": analysis,
                 "room_profile": profile_name,
-                    "white_balance": wb_log,
+                "white_balance": wb_log,
                 "exposure": exposure_log,
                 "windows": window_log,
                 "materials": materials_log,
@@ -380,6 +428,7 @@ def main() -> int:
         )
 
     print("=" * 72)
+    print(f"PIPELINE: {pipeline_mode.upper()}")
     print(f"PASS: {passed} | REVIEW: {reviewed} | FAILED: {failed}")
     print(f"ENGINE SCORE: {score_summary['overall_engine_score']}/100")
     print("Review output/comparisons/_batch_contact_sheet.jpg")
