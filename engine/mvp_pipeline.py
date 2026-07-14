@@ -5,7 +5,7 @@ from typing import Any
 import numpy as np
 
 from .exposure_fusion import exposure_fusion
-from .materials2 import restore_protected_chroma
+from .materials2 import apply_material_guardrails
 from .profiles import detect_room_profile
 from .tone_classify import classify_tones
 from .utils import analyze_image
@@ -40,7 +40,9 @@ def process_mvp_core(
     analysis["room_profile"] = profile_name
 
     exposed, exposure_log = exposure_fusion(wb)
-    protected, materials_log = restore_protected_chroma(wb, exposed, scene)
+    protected, materials_log = apply_material_guardrails(
+        wb, exposed, scene, settings.get("material_guardrails", {})
+    )
 
     return {
         "wb": wb,

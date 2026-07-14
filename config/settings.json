@@ -52,5 +52,12 @@
     "material_inherit_factor": 1.0,
     "edge_aware_propagation": true,
     "window_recovery_adaptive": true
+  },
+  "material_guardrails": {
+    "dark_wall_max_lift": 0.055,
+    "dark_material_max_lift": 0.075,
+    "chroma_restore_strength": 0.5,
+    "floor_chroma_restore_strength": 0.62,
+    "ceiling_chroma_limit": 3.0
   }
 }
