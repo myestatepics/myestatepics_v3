@@ -21,7 +21,8 @@ def restore_protected_chroma(
     Restore only a small fraction of original chroma.
     Floors are now included in protected materials.
     """
-    strength_value = 0.22
+    # RC3.2: stronger preservation of photographed material color
+    strength_value = 0.38
 
     original_f = original.astype(np.float32) / 255.0
     y = (
