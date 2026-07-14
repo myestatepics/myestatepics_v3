@@ -32,16 +32,17 @@ def _lum(rgb):
     return 0.2126 * f[..., 0] + 0.7152 * f[..., 1] + 0.0722 * f[..., 2]
 
 
-def test_two_pass_wb_removes_tungsten_cast():
+def test_single_pass_wb_reduces_tungsten_cast():
     rgb, scene = make_cast_room()
     pass1, p1log = global_pass1_wb(rgb, scene)
     assert p1log["pass1_applied"] is True
     tones, _ = classify_tones(pass1, scene, {})
-    assert tones["ceiling"]["ceiling_is_neutral_reference"] is True
-    wb, _ = semantic_white_balance(pass1, scene, tones)
-    f = wb.astype(np.float32) / 255.0
-    ceil_rgb = f[:135].reshape(-1, 3).mean(axis=0)
-    assert float(ceil_rgb.max() - ceil_rgb.min()) < 0.006
+    wb, second_log = semantic_white_balance(pass1, scene, tones)
+    assert second_log["reason"] == "single_pass_already_completed"
+    assert np.array_equal(wb, pass1)
+    before = rgb[:135].reshape(-1, 3).mean(axis=0)
+    after = wb[:135].reshape(-1, 3).mean(axis=0)
+    assert float(after.max() - after.min()) < float(before.max() - before.min())
 
 
 def test_dark_neutral_ceiling_keeps_full_target():
