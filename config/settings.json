@@ -58,7 +58,8 @@
     "dark_material_max_lift": 0.075,
     "chroma_restore_strength": 0.5,
     "floor_chroma_restore_strength": 0.62,
-    "ceiling_chroma_limit": 3.0
+    "ceiling_chroma_limit": 3.0,
+    "floor_max_lift": 0.2
   },
   "quality_validation": {
     "highlight_clip_percent": 1.8,
@@ -83,6 +84,9 @@
     "saturation_weight": 0.25,
     "exposure_weight": 1.0,
     "local_contrast_clip_limit": 1.5,
-    "local_contrast_grid": 8
+    "local_contrast_grid": 8,
+    "floor_target_median": 0.42,
+    "floor_max_lift": 0.18,
+    "floor_recovery_strength": 0.9
   }
 }

@@ -46,6 +46,7 @@ def apply_material_guardrails(
     cfg = (settings or {}).get("material_guardrails", settings or {})
     dark_wall_max_lift = float(cfg.get("dark_wall_max_lift", 0.055))
     dark_material_max_lift = float(cfg.get("dark_material_max_lift", 0.075))
+    floor_max_lift = float(cfg.get("floor_max_lift", 0.20))
     chroma_restore = float(cfg.get("chroma_restore_strength", 0.50))
     floor_restore = float(cfg.get("floor_chroma_restore_strength", 0.62))
     ceiling_chroma_limit = float(cfg.get("ceiling_chroma_limit", 3.0))
@@ -63,15 +64,17 @@ def apply_material_guardrails(
     out_y = _luma(corrected)
 
     # Confidence ramps: darkest surfaces get the strongest luminance hold.
-    very_dark = 1.0 - _smoothstep(0.10, 0.30, ref_y)
+    very_dark = 1.0 - _smoothstep(0.12, 0.38, ref_y)
     dark = 1.0 - _smoothstep(0.16, 0.42, ref_y)
     wall_hold = wall * very_dark
-    material_mask = np.maximum.reduce([floor, cabinet, furnishings, protected])
-    material_hold = material_mask * dark
+    nonfloor_material = np.maximum.reduce([cabinet, furnishings, protected])
+    material_hold = nonfloor_material * dark
+    floor_hold = floor * dark
 
-    active_hold = np.maximum(wall_hold, material_hold)
-    wall_dominant = wall_hold >= material_hold
-    lift_limit = np.where(wall_dominant, dark_wall_max_lift, dark_material_max_lift)
+    active_hold = np.maximum.reduce([wall_hold, material_hold, floor_hold])
+    lift_limit = np.full(shape, dark_material_max_lift, dtype=np.float32)
+    lift_limit = np.where(wall_hold >= np.maximum(material_hold, floor_hold), dark_wall_max_lift, lift_limit)
+    lift_limit = np.where(floor_hold > np.maximum(wall_hold, material_hold), floor_max_lift, lift_limit)
     allowed = ref_y + lift_limit
     excess = np.maximum(out_y - allowed, 0.0)
     # Semantic masks are already edge-refined. Apply the limit fully in the
@@ -114,9 +117,10 @@ def apply_material_guardrails(
     held = active_hold > 0.10
 
     return out, {
-        "engine": "material_dark_surface_guardrails_v1",
+        "engine": "material_dark_surface_guardrails_v2",
         "dark_wall_max_lift": dark_wall_max_lift,
         "dark_material_max_lift": dark_material_max_lift,
+        "floor_max_lift": floor_max_lift,
         "chroma_restore_strength": chroma_restore,
         "floor_chroma_restore_strength": floor_restore,
         "held_area_percent": float(np.mean(held) * 100.0),

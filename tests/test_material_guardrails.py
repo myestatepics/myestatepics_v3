@@ -29,7 +29,7 @@ def test_dark_wall_lift_is_bounded():
     wall = _scene(h, w).masks["wall"] > 0.5
     lift = np.mean(_luma(out)[wall] - _luma(ref)[wall])
     assert lift < 0.075
-    assert log["engine"] == "material_dark_surface_guardrails_v1"
+    assert log["engine"] == "material_dark_surface_guardrails_v2"
 
 
 def test_floor_hue_moves_toward_reference():

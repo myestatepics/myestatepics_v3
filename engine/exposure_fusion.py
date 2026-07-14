@@ -24,6 +24,9 @@ class ExposureFusionConfig:
     local_contrast_strength: float = 0.10
     local_contrast_clip_limit: float = 1.6
     local_contrast_grid: int = 8
+    floor_target_median: float = 0.42
+    floor_max_lift: float = 0.18
+    floor_recovery_strength: float = 0.90
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,7 @@ def _robust_luminance_stats(rgb: np.ndarray) -> tuple[float, float, float, float
 def adaptive_exposure_config(
     rgb: np.ndarray,
     settings: dict | None = None,
+    scene=None,
 ) -> tuple[ExposureFusionConfig, dict]:
     """Build a restrained scene-adaptive exposure configuration.
 
@@ -96,30 +100,65 @@ def adaptive_exposure_config(
     base = dict(settings or {})
     median, mean, p25, shadow_clip, highlight_clip = _robust_luminance_stats(rgb)
 
-    if median < 0.24 or p25 < 0.10:
+    # Use semantic masks only to measure the room, never to independently alter
+    # colour channels. Bright windows are excluded from the target calculation.
+    f = rgb.astype(np.float32) / 255.0
+    y = _luminance_float(f)
+    room_median = median
+    room_p25 = p25
+    floor_median = None
+    floor_coverage = 0.0
+    if scene is not None:
+        structure = scene.masks.get("structure")
+        window = scene.masks.get("window")
+        floor = scene.masks.get("floor")
+        if structure is not None:
+            valid = structure > 0.45
+            if window is not None:
+                valid &= window < 0.25
+            valid &= (y > 0.015) & (y < 0.90)
+            values = y[valid]
+            if values.size >= 512:
+                room_median = float(np.median(values))
+                room_p25 = float(np.percentile(values, 25.0))
+        if floor is not None:
+            floor_valid = (floor > 0.50) & (y > 0.015) & (y < 0.90)
+            floor_values = y[floor_valid]
+            floor_coverage = float(np.mean(floor > 0.50) * 100.0)
+            if floor_values.size >= 256:
+                floor_median = float(np.median(floor_values))
+
+    if room_median < 0.27 or room_p25 < 0.12:
         profile = "dark_interior"
         defaults = {
-            "target_median": 0.54,
-            "max_bright_ev": 1.45,
-            "final_strength": 0.94,
-            "local_contrast_strength": 0.12,
+            "target_median": 0.59,
+            "max_bright_ev": 1.70,
+            "final_strength": 0.98,
+            "local_contrast_strength": 0.10,
         }
-    elif median < 0.36 or p25 < 0.17:
+    elif room_median < 0.40 or room_p25 < 0.20:
         profile = "dim_interior"
         defaults = {
-            "target_median": 0.52,
-            "max_bright_ev": 1.30,
-            "final_strength": 0.90,
-            "local_contrast_strength": 0.10,
+            "target_median": 0.56,
+            "max_bright_ev": 1.50,
+            "final_strength": 0.95,
+            "local_contrast_strength": 0.09,
         }
     else:
         profile = "balanced_interior"
         defaults = {
-            "target_median": 0.49,
-            "max_bright_ev": 1.10,
-            "final_strength": 0.82,
-            "local_contrast_strength": 0.08,
+            "target_median": 0.52,
+            "max_bright_ev": 1.15,
+            "final_strength": 0.84,
+            "local_contrast_strength": 0.07,
         }
+
+    # A visibly dark floor is a strong signal that the MLS interior still
+    # needs more opening, but cap the adjustment so bright rooms stay natural.
+    if floor_median is not None and floor_coverage >= 2.0:
+        floor_deficit = max(0.0, 0.34 - floor_median)
+        defaults["target_median"] = min(0.61, defaults["target_median"] + min(0.035, floor_deficit * 0.18))
+        defaults["final_strength"] = min(0.99, defaults["final_strength"] + min(0.025, floor_deficit * 0.12))
 
     defaults.update(base)
     cfg = ExposureFusionConfig(**defaults)
@@ -128,6 +167,10 @@ def adaptive_exposure_config(
         "input_median": median,
         "input_mean": mean,
         "input_p25": p25,
+        "room_median": room_median,
+        "room_p25": room_p25,
+        "floor_median": floor_median,
+        "floor_coverage_pct": floor_coverage,
         "input_shadow_clip_pct": shadow_clip,
         "input_highlight_clip_pct": highlight_clip,
     }
@@ -261,10 +304,68 @@ def _gentle_luminance_contrast(
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
 
 
+
+def recover_floor_shadows(
+    reference: np.ndarray,
+    corrected: np.ndarray,
+    scene,
+    config: ExposureFusionConfig,
+) -> tuple[np.ndarray, dict]:
+    """Open dark floor detail in LAB luminance without changing floor hue."""
+    if scene is None or "floor" not in scene.masks:
+        return corrected.copy(), {"applied": False, "reason": "no_floor_mask"}
+
+    floor = np.clip(scene.masks["floor"].astype(np.float32), 0.0, 1.0)
+    confident = floor > 0.50
+    if np.count_nonzero(confident) < 256:
+        return corrected.copy(), {"applied": False, "reason": "insufficient_floor_pixels"}
+
+    ref_f = reference.astype(np.float32) / 255.0
+    ref_y = _luminance_float(ref_f)
+    floor_values = ref_y[confident & (ref_y > 0.015) & (ref_y < 0.90)]
+    if floor_values.size < 256:
+        return corrected.copy(), {"applied": False, "reason": "invalid_floor_pixels"}
+
+    floor_median = float(np.median(floor_values))
+    requested = max(0.0, float(config.floor_target_median) - floor_median)
+    lift = min(float(config.floor_max_lift), requested)
+    if lift < 0.008:
+        return corrected.copy(), {
+            "applied": False,
+            "reason": "floor_already_bright",
+            "input_floor_median": floor_median,
+        }
+
+    # Feather mask edges while keeping the confident interior effective.
+    sigma = max(2.0, min(reference.shape[:2]) / 180.0)
+    feather = cv2.GaussianBlur(floor, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    feather = np.clip(feather, 0.0, 1.0)
+    visibility = _smoothstep(0.025, 0.13, ref_y)
+    # Darker floor pixels receive more recovery, but photographed black remains anchored.
+    darkness = 1.0 - _smoothstep(floor_median, min(0.70, floor_median + 0.30), ref_y)
+    amount = float(config.floor_recovery_strength) * feather * visibility * (0.45 + 0.55 * darkness)
+
+    lab = cv2.cvtColor(corrected, cv2.COLOR_RGB2LAB).astype(np.float32)
+    current_l = lab[..., 0] / 255.0
+    target_l = np.minimum(1.0, current_l + lift)
+    lab[..., 0] = 255.0 * (current_l * (1.0 - amount) + target_l * amount)
+    out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    out_y = _luminance_float(out.astype(np.float32) / 255.0)
+    return out, {
+        "applied": True,
+        "input_floor_median": floor_median,
+        "output_floor_median": float(np.median(out_y[confident])),
+        "requested_lift": requested,
+        "applied_lift_cap": lift,
+        "floor_target_median": float(config.floor_target_median),
+        "floor_coverage_pct": float(np.mean(confident) * 100.0),
+    }
+
 def exposure_fusion(
     rgb: np.ndarray,
     config: ExposureFusionConfig | None = None,
     adaptive_settings: dict | None = None,
+    scene=None,
 ) -> tuple[np.ndarray, dict]:
     """Conservatively brighten an RGB uint8 image using exposure fusion.
 
@@ -275,10 +376,10 @@ def exposure_fusion(
     """
     _validate_rgb(rgb)
     if config is None:
-        cfg, adaptive_log = adaptive_exposure_config(rgb, adaptive_settings)
+        cfg, adaptive_log = adaptive_exposure_config(rgb, adaptive_settings, scene)
     else:
         cfg = config
-        _, adaptive_log = adaptive_exposure_config(rgb, adaptive_settings)
+        _, adaptive_log = adaptive_exposure_config(rgb, adaptive_settings, scene)
         adaptive_log["adaptive_profile"] = "explicit_config"
     exposures, plan = generate_virtual_exposures(rgb, cfg)
 
@@ -295,6 +396,7 @@ def exposure_fusion(
     fused_u8 = np.clip(fused * 255.0 + 0.5, 0, 255).astype(np.uint8)
     output = _blend_with_original(rgb, fused_u8, cfg)
     output = _gentle_luminance_contrast(output, rgb, cfg)
+    output, floor_log = recover_floor_shadows(rgb, output, scene, cfg)
 
     out_median, out_mean, out_p25, out_shadow_clip, out_highlight_clip = _robust_luminance_stats(output)
     metrics = ExposureMetrics(
@@ -314,9 +416,10 @@ def exposure_fusion(
     )
 
     return output, {
-        "engine": "adaptive_bounded_mertens_exposure_fusion_v2",
+        "engine": "scene_aware_mertens_exposure_fusion_v3",
         "metrics": asdict(metrics),
         "config": asdict(cfg),
         "adaptive": adaptive_log,
         "output_p25": out_p25,
+        "floor_recovery": floor_log,
     }
