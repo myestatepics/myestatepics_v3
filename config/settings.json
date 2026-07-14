@@ -72,5 +72,17 @@
     "floor_luminance_shift": 0.18,
     "wall_uniformity_increase": 0.08,
     "residual_cast": 5.0
+  },
+  "adaptive_exposure": {
+    "max_dark_ev": 0.65,
+    "highlight_guard_start": 0.7,
+    "highlight_guard_end": 0.95,
+    "shadow_anchor_start": 0.02,
+    "shadow_anchor_end": 0.1,
+    "contrast_weight": 1.0,
+    "saturation_weight": 0.25,
+    "exposure_weight": 1.0,
+    "local_contrast_clip_limit": 1.5,
+    "local_contrast_grid": 8
   }
 }

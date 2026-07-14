@@ -39,7 +39,9 @@ def process_mvp_core(
     analysis.update(profile_dynamics)
     analysis["room_profile"] = profile_name
 
-    exposed, exposure_log = exposure_fusion(wb)
+    exposed, exposure_log = exposure_fusion(
+        wb, adaptive_settings=settings.get("adaptive_exposure", {})
+    )
     protected, materials_log = apply_material_guardrails(
         wb, exposed, scene, settings.get("material_guardrails", {})
     )

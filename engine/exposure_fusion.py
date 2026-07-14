@@ -21,6 +21,9 @@ class ExposureFusionConfig:
     saturation_weight: float = 0.35
     exposure_weight: float = 1.0
     final_strength: float = 0.86
+    local_contrast_strength: float = 0.10
+    local_contrast_clip_limit: float = 1.6
+    local_contrast_grid: int = 8
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,8 @@ class ExposureMetrics:
     bright_ev: float
     dark_ev: float
     virtual_exposure_count: int
+    input_p25: float
+    adaptive_profile: str
 
 
 def _validate_rgb(rgb: np.ndarray) -> None:
@@ -62,7 +67,7 @@ def _luminance_float(rgb_float: np.ndarray) -> np.ndarray:
     )
 
 
-def _robust_luminance_stats(rgb: np.ndarray) -> tuple[float, float, float, float]:
+def _robust_luminance_stats(rgb: np.ndarray) -> tuple[float, float, float, float, float]:
     f = rgb.astype(np.float32) / 255.0
     y = _luminance_float(f)
     valid = y[(y > 0.01) & (y < 0.99)]
@@ -71,9 +76,61 @@ def _robust_luminance_stats(rgb: np.ndarray) -> tuple[float, float, float, float
     return (
         float(np.median(valid)),
         float(np.mean(valid)),
+        float(np.percentile(valid, 25.0)),
         float(np.mean(y <= (4.0 / 255.0)) * 100.0),
         float(np.mean(y >= (251.0 / 255.0)) * 100.0),
     )
+
+
+def adaptive_exposure_config(
+    rgb: np.ndarray,
+    settings: dict | None = None,
+) -> tuple[ExposureFusionConfig, dict]:
+    """Build a restrained scene-adaptive exposure configuration.
+
+    Dark interiors receive a stronger median target and blend strength. Bright
+    rooms remain close to the conservative defaults. The decision uses only
+    global luminance statistics, keeping segmentation out of the correction.
+    """
+    _validate_rgb(rgb)
+    base = dict(settings or {})
+    median, mean, p25, shadow_clip, highlight_clip = _robust_luminance_stats(rgb)
+
+    if median < 0.24 or p25 < 0.10:
+        profile = "dark_interior"
+        defaults = {
+            "target_median": 0.54,
+            "max_bright_ev": 1.45,
+            "final_strength": 0.94,
+            "local_contrast_strength": 0.12,
+        }
+    elif median < 0.36 or p25 < 0.17:
+        profile = "dim_interior"
+        defaults = {
+            "target_median": 0.52,
+            "max_bright_ev": 1.30,
+            "final_strength": 0.90,
+            "local_contrast_strength": 0.10,
+        }
+    else:
+        profile = "balanced_interior"
+        defaults = {
+            "target_median": 0.49,
+            "max_bright_ev": 1.10,
+            "final_strength": 0.82,
+            "local_contrast_strength": 0.08,
+        }
+
+    defaults.update(base)
+    cfg = ExposureFusionConfig(**defaults)
+    return cfg, {
+        "adaptive_profile": profile,
+        "input_median": median,
+        "input_mean": mean,
+        "input_p25": p25,
+        "input_shadow_clip_pct": shadow_clip,
+        "input_highlight_clip_pct": highlight_clip,
+    }
 
 
 def _bounded_ev_plan(median: float, cfg: ExposureFusionConfig) -> tuple[float, float]:
@@ -129,7 +186,7 @@ def generate_virtual_exposures(
     """Return dark, original and bright virtual exposures plus diagnostics."""
     _validate_rgb(rgb)
     cfg = config or ExposureFusionConfig()
-    median, mean, shadow_clip, highlight_clip = _robust_luminance_stats(rgb)
+    median, mean, p25, shadow_clip, highlight_clip = _robust_luminance_stats(rgb)
     bright_ev, dark_ev = _bounded_ev_plan(median, cfg)
 
     exposures = [
@@ -140,6 +197,7 @@ def generate_virtual_exposures(
     return exposures, {
         "input_median": median,
         "input_mean": mean,
+        "input_p25": p25,
         "input_shadow_clip_pct": shadow_clip,
         "input_highlight_clip_pct": highlight_clip,
         "bright_ev": bright_ev,
@@ -171,9 +229,42 @@ def _blend_with_original(
     return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+def _gentle_luminance_contrast(
+    rgb: np.ndarray,
+    original: np.ndarray,
+    cfg: ExposureFusionConfig,
+) -> np.ndarray:
+    """Add restrained local contrast in LAB luminance only.
+
+    The effect is faded out in deep blacks and highlights, and chroma channels
+    are left untouched. This improves cabinet/island separation without HDR
+    halos or material hue changes.
+    """
+    if cfg.local_contrast_strength <= 0.0:
+        return rgb.copy()
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    l_u8 = np.clip(lab[..., 0], 0, 255).astype(np.uint8)
+    grid = max(2, int(cfg.local_contrast_grid))
+    clahe = cv2.createCLAHE(
+        clipLimit=float(cfg.local_contrast_clip_limit),
+        tileGridSize=(grid, grid),
+    )
+    enhanced_l = clahe.apply(l_u8).astype(np.float32)
+
+    original_f = original.astype(np.float32) / 255.0
+    y = _luminance_float(original_f)
+    black_guard = _smoothstep(0.04, 0.13, y)
+    highlight_guard = 1.0 - _smoothstep(0.72, 0.94, y)
+    amount = cfg.local_contrast_strength * black_guard * highlight_guard
+    lab[..., 0] = lab[..., 0] * (1.0 - amount) + enhanced_l * amount
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+
 def exposure_fusion(
     rgb: np.ndarray,
     config: ExposureFusionConfig | None = None,
+    adaptive_settings: dict | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Conservatively brighten an RGB uint8 image using exposure fusion.
 
@@ -183,7 +274,12 @@ def exposure_fusion(
     It does not use semantic masks and does not independently alter channels.
     """
     _validate_rgb(rgb)
-    cfg = config or ExposureFusionConfig()
+    if config is None:
+        cfg, adaptive_log = adaptive_exposure_config(rgb, adaptive_settings)
+    else:
+        cfg = config
+        _, adaptive_log = adaptive_exposure_config(rgb, adaptive_settings)
+        adaptive_log["adaptive_profile"] = "explicit_config"
     exposures, plan = generate_virtual_exposures(rgb, cfg)
 
     merger = cv2.createMergeMertens(
@@ -198,8 +294,9 @@ def exposure_fusion(
     fused = np.clip(fused_float, 0.0, 1.0)
     fused_u8 = np.clip(fused * 255.0 + 0.5, 0, 255).astype(np.uint8)
     output = _blend_with_original(rgb, fused_u8, cfg)
+    output = _gentle_luminance_contrast(output, rgb, cfg)
 
-    out_median, out_mean, out_shadow_clip, out_highlight_clip = _robust_luminance_stats(output)
+    out_median, out_mean, out_p25, out_shadow_clip, out_highlight_clip = _robust_luminance_stats(output)
     metrics = ExposureMetrics(
         input_median=plan["input_median"],
         output_median=out_median,
@@ -212,10 +309,14 @@ def exposure_fusion(
         bright_ev=plan["bright_ev"],
         dark_ev=plan["dark_ev"],
         virtual_exposure_count=len(exposures),
+        input_p25=plan["input_p25"],
+        adaptive_profile=adaptive_log["adaptive_profile"],
     )
 
     return output, {
-        "engine": "bounded_mertens_exposure_fusion_v1",
+        "engine": "adaptive_bounded_mertens_exposure_fusion_v2",
         "metrics": asdict(metrics),
         "config": asdict(cfg),
+        "adaptive": adaptive_log,
+        "output_p25": out_p25,
     }
