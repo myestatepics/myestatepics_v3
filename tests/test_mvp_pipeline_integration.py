@@ -29,7 +29,7 @@ def test_mvp_core_runs_single_wb_then_exposure_fusion():
 
     assert result["protected"].shape == image.shape
     assert result["protected"].dtype == np.uint8
-    assert result["exposure_log"]["engine"] == "semantic_scene_aware_exposure_fusion_v4"
+    assert result["exposure_log"]["engine"] == "scene_aware_mertens_exposure_fusion_v3"
     assert result["window_log"]["status"] == "skipped_mvp_phase3"
     assert "gains" in result["wb_log"]
 

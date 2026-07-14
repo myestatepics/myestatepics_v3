@@ -27,15 +27,6 @@ class ExposureFusionConfig:
     floor_target_median: float = 0.42
     floor_max_lift: float = 0.18
     floor_recovery_strength: float = 0.90
-    semantic_exposure_enabled: bool = True
-    wall_target_median: float = 0.64
-    ceiling_target_median: float = 0.74
-    semantic_floor_target_median: float = 0.50
-    wall_max_lift: float = 0.16
-    ceiling_max_lift: float = 0.14
-    semantic_floor_max_lift: float = 0.22
-    semantic_strength: float = 0.82
-    semantic_feather_divisor: float = 160.0
 
 
 @dataclass(frozen=True)
@@ -370,113 +361,6 @@ def recover_floor_shadows(
         "floor_coverage_pct": float(np.mean(confident) * 100.0),
     }
 
-
-def _region_median(y: np.ndarray, mask: np.ndarray, minimum_pixels: int = 256) -> float | None:
-    valid = (mask > 0.50) & (y > 0.015) & (y < 0.92)
-    values = y[valid]
-    if values.size < minimum_pixels:
-        return None
-    return float(np.median(values))
-
-
-def _feather_mask(mask: np.ndarray, shape: tuple[int, int], divisor: float) -> np.ndarray:
-    sigma = max(2.0, min(shape) / max(divisor, 1.0))
-    blurred = cv2.GaussianBlur(np.clip(mask.astype(np.float32), 0.0, 1.0), (0, 0), sigmaX=sigma, sigmaY=sigma)
-    return np.clip(blurred, 0.0, 1.0)
-
-
-def apply_semantic_exposure(
-    reference: np.ndarray,
-    corrected: np.ndarray,
-    scene,
-    config: ExposureFusionConfig,
-) -> tuple[np.ndarray, dict]:
-    """Apply bounded luminance-only exposure targets by semantic region.
-
-    This pass does not alter RGB channels independently. It lifts ceilings,
-    walls and floors according to their own measured luminance, while
-    excluding windows and feathering all mask boundaries.
-    """
-    if not config.semantic_exposure_enabled or scene is None:
-        return corrected.copy(), {"applied": False, "reason": "disabled_or_no_scene"}
-
-    h, w = reference.shape[:2]
-    ref_y = _luminance_float(reference.astype(np.float32) / 255.0)
-    lab = cv2.cvtColor(corrected, cv2.COLOR_RGB2LAB).astype(np.float32)
-    current_l = lab[..., 0] / 255.0
-
-    window = np.clip(scene.masks.get("window", np.zeros((h, w), np.float32)), 0.0, 1.0)
-    regions = {
-        "ceiling": ("ceiling", config.ceiling_target_median, config.ceiling_max_lift),
-        "wall": ("wall", config.wall_target_median, config.wall_max_lift),
-        "floor": ("floor", config.semantic_floor_target_median, config.semantic_floor_max_lift),
-    }
-
-    total_amount = np.zeros((h, w), np.float32)
-    total_delta = np.zeros((h, w), np.float32)
-    logs: dict[str, dict] = {}
-
-    for region_name, (mask_name, target, max_lift) in regions.items():
-        raw = np.clip(scene.masks.get(mask_name, np.zeros((h, w), np.float32)), 0.0, 1.0)
-        raw = raw * (1.0 - window)
-        median = _region_median(ref_y, raw)
-        if median is None:
-            logs[region_name] = {"applied": False, "reason": "insufficient_pixels"}
-            continue
-
-        requested = max(0.0, float(target) - median)
-        lift = min(float(max_lift), requested)
-        if lift < 0.006:
-            logs[region_name] = {
-                "applied": False,
-                "reason": "already_bright",
-                "input_median": median,
-                "target_median": float(target),
-            }
-            continue
-
-        feather = _feather_mask(raw, (h, w), config.semantic_feather_divisor)
-        visibility = _smoothstep(0.02, 0.12, ref_y)
-        highlight_guard = 1.0 - _smoothstep(0.72, 0.94, ref_y)
-        amount = float(config.semantic_strength) * feather * visibility * highlight_guard
-
-        # Darker pixels inside each material receive more lift, but the entire
-        # region moves toward its own target to avoid a patchy result.
-        darkness = 1.0 - _smoothstep(median, min(0.90, median + 0.28), ref_y)
-        region_amount = amount * (0.55 + 0.45 * darkness)
-        total_amount = np.maximum(total_amount, region_amount)
-        total_delta += lift * region_amount
-
-        logs[region_name] = {
-            "applied": True,
-            "input_median": median,
-            "target_median": float(target),
-            "requested_lift": requested,
-            "applied_lift_cap": lift,
-            "coverage_pct": float(np.mean(raw > 0.50) * 100.0),
-        }
-
-    if not np.any(total_amount > 0.001):
-        return corrected.copy(), {"applied": False, "reason": "no_regions_needed_lift", "regions": logs}
-
-    target_l = np.clip(current_l + total_delta, 0.0, 1.0)
-    lab[..., 0] = 255.0 * (current_l * (1.0 - total_amount) + target_l * total_amount)
-    out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
-
-    out_y = _luminance_float(out.astype(np.float32) / 255.0)
-    for region_name, (mask_name, _, _) in regions.items():
-        if logs.get(region_name, {}).get("applied"):
-            raw = np.clip(scene.masks.get(mask_name, np.zeros((h, w), np.float32)), 0.0, 1.0) * (1.0 - window)
-            median = _region_median(out_y, raw)
-            logs[region_name]["output_median"] = median
-
-    return out, {
-        "applied": True,
-        "engine": "semantic_luminance_targets_v1",
-        "regions": logs,
-        "mean_active_strength": float(np.mean(total_amount[total_amount > 0.01])) if np.any(total_amount > 0.01) else 0.0,
-    }
-
 def exposure_fusion(
     rgb: np.ndarray,
     config: ExposureFusionConfig | None = None,
@@ -512,7 +396,6 @@ def exposure_fusion(
     fused_u8 = np.clip(fused * 255.0 + 0.5, 0, 255).astype(np.uint8)
     output = _blend_with_original(rgb, fused_u8, cfg)
     output = _gentle_luminance_contrast(output, rgb, cfg)
-    output, semantic_log = apply_semantic_exposure(rgb, output, scene, cfg)
     output, floor_log = recover_floor_shadows(rgb, output, scene, cfg)
 
     out_median, out_mean, out_p25, out_shadow_clip, out_highlight_clip = _robust_luminance_stats(output)
@@ -533,11 +416,10 @@ def exposure_fusion(
     )
 
     return output, {
-        "engine": "semantic_scene_aware_exposure_fusion_v4",
+        "engine": "scene_aware_mertens_exposure_fusion_v3",
         "metrics": asdict(metrics),
         "config": asdict(cfg),
         "adaptive": adaptive_log,
         "output_p25": out_p25,
-        "semantic_exposure": semantic_log,
         "floor_recovery": floor_log,
     }
