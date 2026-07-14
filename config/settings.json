@@ -87,6 +87,15 @@
     "local_contrast_grid": 8,
     "floor_target_median": 0.42,
     "floor_max_lift": 0.18,
-    "floor_recovery_strength": 0.9
+    "floor_recovery_strength": 0.9,
+    "semantic_exposure_enabled": true,
+    "wall_target_median": 0.64,
+    "ceiling_target_median": 0.74,
+    "semantic_floor_target_median": 0.5,
+    "wall_max_lift": 0.16,
+    "ceiling_max_lift": 0.14,
+    "semantic_floor_max_lift": 0.22,
+    "semantic_strength": 0.82,
+    "semantic_feather_divisor": 160.0
   }
 }
