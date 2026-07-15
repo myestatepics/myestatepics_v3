@@ -239,6 +239,271 @@ def _lock_lab_chroma(original: np.ndarray, lifted: np.ndarray) -> np.ndarray:
     dst[..., 2] = src[..., 2]
     return cv2.cvtColor(np.clip(dst, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
 
+
+def _soft_semantic_weight(mask: np.ndarray, sigma: float) -> np.ndarray:
+    """Return a feathered semantic weight with no hard correction boundary."""
+    source = np.clip(mask.astype(np.float32), 0.0, 1.0)
+    if not np.any(source > 0.01):
+        return np.zeros_like(source)
+    blurred = cv2.GaussianBlur(source, (0, 0), max(1.0, sigma))
+    return np.clip(blurred, 0.0, 1.0)
+
+
+def _rc4_valid_measurement(
+    y: np.ndarray,
+    weight: np.ndarray,
+    exclusion: np.ndarray,
+    *,
+    reject_deep_black: bool,
+) -> np.ndarray:
+    valid = (weight > 0.35) & (exclusion < 0.20) & (y < 0.94)
+    valid &= y > (0.060 if reject_deep_black else 0.018)
+    return valid
+
+
+def _rc4_measure(
+    y: np.ndarray,
+    weights: dict[str, np.ndarray],
+    exclusion: np.ndarray,
+) -> dict[str, dict[str, float | int | None]]:
+    result: dict[str, dict[str, float | int | None]] = {}
+    for name, weight in weights.items():
+        valid = _rc4_valid_measurement(
+            y, weight, exclusion,
+            reject_deep_black=name in {"general", "wall"},
+        )
+        values = y[valid]
+        result[name] = {
+            "pixels": int(values.size),
+            "median": float(np.median(values)) if values.size >= 256 else None,
+            "p35": float(np.percentile(values, 35.0)) if values.size >= 256 else None,
+            "p75": float(np.percentile(values, 75.0)) if values.size >= 256 else None,
+        }
+    return result
+
+
+def _rc4_targets(measured: dict[str, dict[str, float | int | None]]) -> dict[str, float]:
+    """Photographic targets with a smooth no-op bias for already-good rooms."""
+    general = measured["general"]["median"]
+    general_value = float(general) if general is not None else 0.45
+    # Targets are placement guides, not forced endpoints. The bounded planner
+    # below applies zero gain when the source already meets a target.
+    targets = {
+        "general": 0.50,
+        "ceiling": 0.64,
+        "wall": 0.55,
+        "floor": 0.38,
+        "contents": 0.36,
+    }
+    wall = measured["wall"]["median"]
+    ceiling = measured["ceiling"]["median"]
+    dark_decor = bool(
+        wall is not None and ceiling is not None
+        and float(wall) < 0.45 * max(float(ceiling), 1e-4)
+    )
+    if dark_decor:
+        # Photograph the intentional dark room, not a fictitious gray room.
+        # The ceiling remains the diffuse exposure witness; black paint is
+        # explicitly not used as a target.
+        targets.update({
+            "general": 0.34,
+            "ceiling": 0.52,
+            "wall": float(wall),
+            "floor": 0.18,
+            "contents": 0.25,
+        })
+    if general_value >= 0.46:
+        # Preserve professionally exposed sources. Individual class targets
+        # may report a deficit, but their gain is gated by room need.
+        targets["general"] = general_value
+    return targets
+
+
+def _rc4_required_ev(value: float | int | None, target: float, cap: float) -> float:
+    if value is None or float(value) <= 1e-4:
+        return 0.0
+    requested = np.log2(max(target, 1e-4) / max(float(value), 1e-4))
+    return float(np.clip(requested, 0.0, cap))
+
+
+def _rc4_gain_plan(
+    y: np.ndarray,
+    weights: dict[str, np.ndarray],
+    exclusion: np.ndarray,
+    measured: dict[str, dict[str, float | int | None]],
+    targets: dict[str, float],
+    *,
+    correction_cap_ev: float | None = None,
+) -> tuple[np.ndarray, dict[str, float]]:
+    caps = {
+        "general": 0.72,
+        "ceiling": 0.82,
+        "wall": 0.72,
+        "floor": 0.35,
+        "contents": 0.40,
+    }
+    wall = measured["wall"]["median"]
+    ceiling = measured["ceiling"]["median"]
+    dark_decor = bool(
+        wall is not None and ceiling is not None
+        and float(wall) < 0.45 * max(float(ceiling), 1e-4)
+    )
+    if dark_decor:
+        caps.update({
+            "general": 0.42,
+            "ceiling": 0.55,
+            "wall": 0.08,
+            "floor": 0.28,
+            "contents": 0.30,
+        })
+    if correction_cap_ev is not None:
+        caps = {name: min(cap, correction_cap_ev) for name, cap in caps.items()}
+        if dark_decor:
+            caps = {name: min(cap, 0.10) for name, cap in caps.items()}
+
+    ev = {
+        name: _rc4_required_ev(measured[name]["median"], targets[name], caps[name])
+        for name in targets
+    }
+    general_need = ev["general"]
+    # Class placement is subordinate to the measured need of the room. This
+    # prevents a dark material or imperfect segmentation from relighting an
+    # otherwise good photograph.
+    room_need = float(_smoothstep(0.015, 0.20, np.array([general_need], np.float32))[0])
+    base = np.full_like(y, ev["general"], dtype=np.float32)
+    weighted = np.zeros_like(y, dtype=np.float32)
+    total_weight = np.zeros_like(y, dtype=np.float32)
+    for name in ("ceiling", "wall", "floor", "contents"):
+        residual = (
+            max(0.0, ev[name] - 0.75 * ev["general"])
+            * room_need
+            * 0.35
+        )
+        weighted += weights[name] * residual
+        total_weight += weights[name]
+    semantic = weighted / np.maximum(total_weight, 1.0)
+    log_gain = np.log(2.0) * (base + semantic)
+
+    black_anchor = _smoothstep(0.022, 0.135, y)
+    shadow_release = 0.86 + 0.14 * (1.0 - _smoothstep(0.34, 0.62, y))
+    highlight_guard = 1.0 - _smoothstep(0.70, 0.94, y)
+    protection = 1.0 - np.clip(exclusion, 0.0, 1.0)
+    log_gain *= black_anchor * shadow_release * highlight_guard * protection
+    return log_gain.astype(np.float32), ev
+
+
+def _apply_rc4_luminance_only(
+    reference: np.ndarray,
+    current: np.ndarray,
+    log_gain: np.ndarray,
+    exclusion_core: np.ndarray,
+) -> np.ndarray:
+    """Change only Lab L; copy approved WB hue/chroma from the source."""
+    src_lab = cv2.cvtColor(reference, cv2.COLOR_RGB2LAB)
+    cur_lab = cv2.cvtColor(current, cv2.COLOR_RGB2LAB).astype(np.float32)
+    l = cur_lab[..., 0] / 255.0
+    cur_lab[..., 0] = np.clip(l * np.exp(log_gain), 0.0, 1.0) * 255.0
+    cur_lab[..., 1:3] = src_lab[..., 1:3]
+    out = cv2.cvtColor(np.clip(cur_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    # Exact preservation inside windows and fixture cores; the surrounding
+    # gain has already been feathered to zero by the exclusion field.
+    core = exclusion_core > 0.95
+    out[core] = reference[core]
+    return out
+
+
+def source_referenced_exposure(
+    rgb: np.ndarray,
+    scene: Scene,
+    analysis: dict | None = None,
+) -> tuple[np.ndarray, dict]:
+    """RC4 source-referenced, luminance-only MLS exposure renderer.
+
+    It performs one bounded semantic exposure placement followed by at most
+    one bounded convergence pass. All color comes from the approved WB input.
+    """
+    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("rgb must be a uint8 HxWx3 array")
+    y0 = _luminance(rgb)
+    h, w = y0.shape
+    sigma = max(20.0, max(h, w) / 75.0)
+
+    content_mask = np.maximum.reduce([
+        scene.masks["cabinet"], scene.masks["sofa"], scene.masks["table"],
+        scene.masks["chair"], scene.masks["bed"], scene.masks["rug"],
+    ])
+    room_mask = np.maximum.reduce([
+        scene.masks["wall"], scene.masks["ceiling"], scene.masks["floor"],
+        content_mask,
+    ])
+    if np.count_nonzero(room_mask > 0.35) < 512:
+        room_mask = np.ones_like(y0, dtype=np.float32)
+    weights = {
+        "general": _soft_semantic_weight(room_mask, sigma),
+        "ceiling": _soft_semantic_weight(scene.masks["ceiling"], sigma),
+        "wall": _soft_semantic_weight(scene.masks["wall"], sigma),
+        "floor": _soft_semantic_weight(scene.masks["floor"], sigma),
+        "contents": _soft_semantic_weight(content_mask, sigma),
+    }
+
+    exclusion_core = np.maximum.reduce([
+        scene.masks["window"], scene.masks["lamp"], scene.masks["mirror"],
+        (y0 >= 0.965).astype(np.float32),
+    ])
+    dilation = max(5, int(round(max(h, w) / 240.0)) | 1)
+    dilated = cv2.dilate(
+        (exclusion_core > 0.25).astype(np.uint8),
+        np.ones((dilation, dilation), np.uint8),
+    ).astype(np.float32)
+    exclusion = np.maximum(
+        exclusion_core,
+        cv2.GaussianBlur(dilated, (0, 0), sigma * 0.75),
+    )
+    exclusion = np.clip(exclusion, 0.0, 1.0)
+
+    before = _rc4_measure(y0, weights, exclusion)
+    targets = _rc4_targets(before)
+    first_gain, first_ev = _rc4_gain_plan(y0, weights, exclusion, before, targets)
+    first = _apply_rc4_luminance_only(rgb, rgb, first_gain, exclusion_core)
+    y1 = _luminance(first)
+    after_first = _rc4_measure(y1, weights, exclusion)
+
+    correction_gain, correction_ev = _rc4_gain_plan(
+        y0, weights, exclusion, after_first, targets, correction_cap_ev=0.20
+    )
+    correction_applied = bool(np.max(correction_gain) > np.log(2.0) * 0.01)
+    if correction_applied:
+        final = _apply_rc4_luminance_only(rgb, first, correction_gain, exclusion_core)
+    else:
+        final = first
+    y2 = _luminance(final)
+    after_final = _rc4_measure(y2, weights, exclusion)
+
+    return final, {
+        "engine": "rc4_source_referenced_luminance_v1",
+        "route": scene.route,
+        "targets": targets,
+        "before": before,
+        "after_first": after_first,
+        "after_final": after_final,
+        "first_pass_ev": first_ev,
+        "corrective_pass_ev": correction_ev,
+        "corrective_pass_applied": correction_applied,
+        "maximum_passes": 2,
+        "passes_executed": 2 if correction_applied else 1,
+        "window_core_mean_abs_change": (
+            float(np.mean(np.abs(final[scene.masks["window"] > 0.95].astype(np.int16) - rgb[scene.masks["window"] > 0.95].astype(np.int16))))
+            if np.any(scene.masks["window"] > 0.95) else 0.0
+        ),
+        "mean_image_luminance_before": float(np.mean(y0)),
+        "mean_image_luminance_after": float(np.mean(y2)),
+        "median_room_luminance_before": before["general"]["median"],
+        "median_room_luminance_after": after_final["general"]["median"],
+        "hue_chroma_source": "approved_wb_input_lab_ab",
+        "geometry_unchanged": final.shape == rgb.shape,
+        "local_corrections": False,
+    }
+
 def adaptive_per_class_exposure(
     rgb: np.ndarray,
     scene: Scene,

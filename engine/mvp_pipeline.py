@@ -4,12 +4,12 @@ from typing import Any
 
 import numpy as np
 
-from .exposure_fusion import exposure_fusion
 from .materials2 import apply_material_guardrails
 from .profiles import detect_room_profile
 from .tone_classify import classify_tones
 from .utils import analyze_image
 from .wb import conservative_white_balance, gentle_wall_chroma_consistency
+from .tonal import source_referenced_exposure
 
 
 def process_mvp_core(
@@ -41,9 +41,7 @@ def process_mvp_core(
     analysis.update(profile_dynamics)
     analysis["room_profile"] = profile_name
 
-    exposed, exposure_log = exposure_fusion(
-        wb, adaptive_settings=settings.get("adaptive_exposure", {}), scene=scene
-    )
+    exposed, exposure_log = source_referenced_exposure(wb, scene, analysis)
     protected, materials_log = apply_material_guardrails(
         wb, exposed, scene, settings.get("material_guardrails", {})
     )

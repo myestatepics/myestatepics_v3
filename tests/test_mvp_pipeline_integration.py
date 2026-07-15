@@ -18,7 +18,7 @@ def _synthetic_scene(h: int, w: int):
     return build_scene(masks, (h, w))
 
 
-def test_mvp_core_runs_single_wb_then_exposure_fusion():
+def test_mvp_core_runs_single_wb_then_rc4_luminance_exposure():
     h, w = 240, 320
     image = np.empty((h, w, 3), np.uint8)
     image[: h // 3] = [135, 120, 100]
@@ -29,8 +29,8 @@ def test_mvp_core_runs_single_wb_then_exposure_fusion():
 
     assert result["protected"].shape == image.shape
     assert result["protected"].dtype == np.uint8
-    assert result["exposure_log"]["engine"] == "scene_wide_mls_luminance_v1"
-    assert result["exposure_log"]["floor_recovery"]["applied"] is False
+    assert result["exposure_log"]["engine"] == "rc4_source_referenced_luminance_v1"
+    assert result["exposure_log"]["maximum_passes"] == 2
     assert result["window_log"]["status"] == "skipped_mvp_phase3"
     assert "gains" in result["wb_log"]
 
