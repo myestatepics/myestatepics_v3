@@ -212,8 +212,9 @@ def test_hdr_c_bounded_color_locks_hue_and_protects_neutrals_and_dark_wood():
     assert abs(float(source_hue[0, 0] - rendered_hue[0, 0])) < 1e-4
     assert float(rendered_chroma[0, 0] / source_chroma[0, 0]) < 1.03
     assert np.max(np.abs(rendered[0, 1] - rendered[0, 1, 0])) < 1e-5
-    assert 1.0 < float(rendered_chroma[0, 2] / source_chroma[0, 2]) <= 1.11
-    assert 0.0 <= stats["maximum_chroma_enhancement_percent"] <= 11.01
+    assert 1.0 < float(rendered_chroma[0, 2] / source_chroma[0, 2]) <= 1.17
+    assert 0.0 <= stats["maximum_chroma_enhancement_percent"] <= 17.01
+    assert 0.0 <= stats["maximum_midtone_refinement_percent"] <= 6.01
 
 
 def test_hdr_c_is_deterministic_and_global_only():

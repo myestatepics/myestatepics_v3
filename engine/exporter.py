@@ -13,7 +13,9 @@ def save_jpeg(
     output_path: Path,
     max_mb: float,
     start_quality: int = 95,
+    min_quality: int = 82,
     expected_shape: tuple[int, int] | None = None,
+    progressive: bool = True,
 ) -> dict:
     if expected_shape is not None and rgb.shape[:2] != expected_shape:
         raise ValueError(
@@ -21,18 +23,25 @@ def save_jpeg(
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    image = Image.fromarray(rgb, mode="RGB")
-    chosen_quality = 83
+    image = Image.fromarray(rgb)
+    if not 1 <= min_quality <= start_quality <= 95:
+        raise ValueError("JPEG quality must satisfy 1 <= min_quality <= start_quality <= 95")
+
+    chosen_quality = min_quality
     chosen_bytes = b""
 
-    for quality in range(start_quality, 81, -2):
+    qualities = list(range(start_quality, min_quality - 1, -2))
+    if qualities[-1] != min_quality:
+        qualities.append(min_quality)
+    for quality in qualities:
         buffer = io.BytesIO()
         image.save(
             buffer,
             format="JPEG",
             quality=quality,
-            subsampling=0,
+            subsampling=2,
             optimize=True,
+            progressive=progressive,
             dpi=(300, 300),
         )
         chosen_quality = quality
@@ -45,9 +54,12 @@ def save_jpeg(
     return {
         "quality": int(chosen_quality),
         "size_mb": float(len(chosen_bytes) / (1024 * 1024)),
+        "size_bytes": int(len(chosen_bytes)),
         "width": int(image.width),
         "height": int(image.height),
         "oversized": bool(oversized),
         "exif_stripped": True,
         "resolution_preserved": True,
+        "progressive": bool(progressive),
+        "optimized": True,
     }

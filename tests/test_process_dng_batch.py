@@ -39,6 +39,7 @@ def test_empty_folder_writes_zero_count_summary_and_contact_sheet(tmp_path):
     assert status == 0
     assert summary["total_count"] == summary["success_count"] == summary["failure_count"] == 0
     assert (output_dir / "batch_summary.json").exists()
+    assert (output_dir / "summary.json").exists()
     assert (output_dir / "batch_contact_sheet.jpg").exists()
 
 

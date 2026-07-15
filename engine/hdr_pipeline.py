@@ -768,15 +768,22 @@ def _hdr_c_source_referenced_color_tile(
 
     # Near-neutrals approach zero enhancement continuously; already vivid
     # colors likewise receive progressively less additional chroma.
-    neutral_gate = _smooth01((source_c - 0.004) / 0.040)
-    vivid_guard = 1.0 / (1.0 + np.power(source_c / 0.105, 4.0))
+    # Preserve the approved source-referenced rendering, then add one small
+    # midtone-only refinement. The refinement never changes source hue.
+    base_neutral_gate = _smooth01((source_c - 0.004) / 0.040)
+    base_vivid_guard = 1.0 / (1.0 + np.power(source_c / 0.105, 4.0))
+    neutral_gate = _smooth01((source_c - 0.010) / 0.028)
+    vivid_guard = 1.0 / (1.0 + np.power(source_c / 0.135, 6.0))
 
     source_l = np.maximum(source_lab[..., 0], 0.0)
     rendered_l = np.clip(mapped_lab[..., 0], 0.0, 1.0)
-    source_midtone = _smooth01(source_l / 0.42)
-    rendered_midtone = _smooth01(rendered_l / 0.48) * _smooth01((1.0 - rendered_l) / 0.32)
+    base_source_midtone = _smooth01(source_l / 0.42)
+    base_rendered_midtone = _smooth01(rendered_l / 0.48) * _smooth01((1.0 - rendered_l) / 0.32)
+    source_midtone = _smooth01(source_l / 0.14)
+    rendered_midtone = _smooth01((rendered_l - 0.12) / 0.24) * _smooth01((0.90 - rendered_l) / 0.20)
     lift_stops = np.maximum(np.log2((rendered_l + 0.015) / (source_l + 0.015)), 0.0)
-    lift_guard = 1.0 / (1.0 + 0.55 * lift_stops * lift_stops)
+    base_lift_guard = 1.0 / (1.0 + 0.55 * lift_stops * lift_stops)
+    lift_guard = 1.0 / (1.0 + 0.08 * lift_stops * lift_stops)
 
     # Measure gamut proximity at the rendered lightness while retaining the
     # source hue/chroma. Colors close to a face of the display cube receive
@@ -787,15 +794,24 @@ def _hdr_c_source_referenced_color_tile(
     gamut_margin = np.minimum(np.min(source_locked_rgb, axis=2), 1.0 - np.max(source_locked_rgb, axis=2))
     gamut_guard = _smooth01(np.maximum(gamut_margin, 0.0) / 0.075)
 
-    opportunity = (
+    base_opportunity = (
+        base_neutral_gate
+        * base_vivid_guard
+        * (0.22 + 0.78 * base_source_midtone)
+        * (0.30 + 0.70 * base_rendered_midtone)
+        * base_lift_guard
+        * gamut_guard
+    )
+    refinement_opportunity = (
         neutral_gate
         * vivid_guard
-        * (0.22 + 0.78 * source_midtone)
-        * (0.30 + 0.70 * rendered_midtone)
+        * (0.65 + 0.35 * source_midtone)
+        * rendered_midtone
         * lift_guard
         * gamut_guard
     )
-    chroma_gain = 1.0 + 0.11 * opportunity
+    refinement_gain = 0.06 * refinement_opportunity
+    chroma_gain = 1.0 + 0.11 * base_opportunity + refinement_gain
     desired_ab = source_lab[..., 1:3] * chroma_gain[..., None]
 
     # Hue-preserving gamut fit. Binary search yields the largest continuous
@@ -823,6 +839,9 @@ def _hdr_c_source_referenced_color_tile(
         "mean_chroma_enhancement_percent": float(np.mean(enhanced) * 100.0),
         "p95_chroma_enhancement_percent": float(np.percentile(enhanced, 95) * 100.0),
         "maximum_chroma_enhancement_percent": float(np.max(enhanced) * 100.0),
+        "mean_midtone_refinement_percent": float(np.mean(refinement_gain) * 100.0),
+        "p95_midtone_refinement_percent": float(np.percentile(refinement_gain, 95) * 100.0),
+        "maximum_midtone_refinement_percent": float(np.max(refinement_gain) * 100.0),
         "gamut_compressed_percent": float(np.mean(compressed) * 100.0),
         "mean_gamut_chroma_reduction_percent": float(np.mean(1.0 - final_fraction) * 100.0),
     }

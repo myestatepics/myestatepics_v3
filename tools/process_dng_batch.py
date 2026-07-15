@@ -27,6 +27,7 @@ from engine.hdr_pipeline import (
     render_hdr_c_global,
     render_neutral_display,
 )
+from engine.photographic_finish import apply_lightroom_look
 from engine.segmentation import SceneSegmenter
 from tools.hdr_a_validation import _segment
 
@@ -88,19 +89,22 @@ def _render_one(
     scene, segmentation_log = _segment(neutral.rgb, segmenter)
     measurements = measure_hdr_b1_scene(master, scene)
     rendered = render_hdr_c_global(master, measurements)
+    final_rgb, finish_log = apply_lightroom_look(rendered.rgb, scene)
 
     output_path = output_dir / f"{source.stem}.jpg"
     export = save_jpeg(
-        _u8(rendered.rgb),
+        _u8(final_rgb),
         output_path,
-        max_mb=25.0,
-        start_quality=95,
+        max_mb=2.5,
+        start_quality=92,
+        min_quality=82,
         expected_shape=master.linear_srgb.shape[:2],
     )
     if debug_stages:
         debug_dir = output_dir / "debug" / source.stem
         _save_debug_stage(neutral.rgb, debug_dir / "01_neutral_display_16bit.png")
         _save_debug_stage(rendered.rgb, debug_dir / "02_hdr_c_final_16bit.png")
+        _save_debug_stage(final_rgb, debug_dir / "03_lightroom_look_16bit.png")
         (debug_dir / "render_log.json").write_text(
             json.dumps(
                 {
@@ -109,6 +113,7 @@ def _render_one(
                     "measurements": hdr_b1_measurements_to_dict(measurements),
                     "segmentation": segmentation_log,
                     "renderer": dict(rendered.log),
+                    "photographic_finish": finish_log,
                     "export": export,
                 },
                 indent=2,
@@ -119,13 +124,14 @@ def _render_one(
         "source_filename": source.name,
         "output_filename": output_path.name,
         "output_path": str(output_path),
-        "dimensions": [int(rendered.rgb.shape[1]), int(rendered.rgb.shape[0])],
+        "dimensions": [int(final_rgb.shape[1]), int(final_rgb.shape[0])],
         "decoder": dict(master.metadata),
         "measurements": hdr_b1_measurements_to_dict(measurements),
         "renderer": dict(rendered.log),
+        "photographic_finish": finish_log,
         "export": export,
     }
-    del master, neutral, scene, measurements, rendered
+    del master, neutral, scene, measurements, rendered, final_rgb
     gc.collect()
     return record
 
@@ -192,7 +198,9 @@ def process_batch(
         "contact_sheet": str(contact_path),
         "debug_stages": bool(debug_stages),
     }
-    (output_dir / "batch_summary.json").write_text(json.dumps(summary, indent=2))
+    summary_json = json.dumps(summary, indent=2)
+    (output_dir / "batch_summary.json").write_text(summary_json)
+    (output_dir / "summary.json").write_text(summary_json)
     print(
         f"Complete: {len(successes)}/{len(sources)} succeeded, {len(failures)} failed. "
         f"Summary: {output_dir / 'batch_summary.json'}",
