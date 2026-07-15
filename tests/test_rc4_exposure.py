@@ -52,7 +52,15 @@ def test_exposure_preserves_hue_chroma_and_geometry():
     out, _ = source_referenced_exposure(rgb, _scene())
     assert out.shape == rgb.shape
     delta_ab = np.abs(_lab_ab(out).astype(np.int16) - _lab_ab(rgb).astype(np.int16))
-    assert float(np.percentile(delta_ab, 99)) <= 2.0
+    assert float(np.max(delta_ab)) <= 1.0
+
+
+def test_saturated_material_reduces_lift_instead_of_changing_chroma():
+    rgb = np.full((240, 320, 3), [115, 30, 12], np.uint8)
+    out, _ = source_referenced_exposure(rgb, _scene())
+    delta_ab = np.abs(_lab_ab(out) - _lab_ab(rgb))
+    assert float(np.max(delta_ab)) <= 1.0
+    assert float(np.median(_luminance(out))) >= float(np.median(_luminance(rgb)))
 
 
 def test_convergence_is_bounded_to_one_corrective_pass():

@@ -402,9 +402,35 @@ def _apply_rc4_luminance_only(
     src_lab = cv2.cvtColor(reference, cv2.COLOR_RGB2LAB)
     cur_lab = cv2.cvtColor(current, cv2.COLOR_RGB2LAB).astype(np.float32)
     l = cur_lab[..., 0] / 255.0
-    cur_lab[..., 0] = np.clip(l * np.exp(log_gain), 0.0, 1.0) * 255.0
-    cur_lab[..., 1:3] = src_lab[..., 1:3]
-    out = cv2.cvtColor(np.clip(cur_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    desired_l = np.clip(l * np.exp(log_gain), 0.0, 1.0) * 255.0
+
+    def render(trial_l: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        trial = cur_lab.copy()
+        trial[..., 0] = trial_l
+        trial[..., 1:3] = src_lab[..., 1:3]
+        trial_rgb = cv2.cvtColor(
+            np.clip(trial, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB
+        )
+        roundtrip = cv2.cvtColor(trial_rgb, cv2.COLOR_RGB2LAB)
+        error = np.max(
+            np.abs(roundtrip[..., 1:3].astype(np.int16) - src_lab[..., 1:3].astype(np.int16)),
+            axis=2,
+        )
+        return trial_rgb, error
+
+    out, error = render(desired_l)
+    needs_gamut_bound = error > 1
+    if np.any(needs_gamut_bound):
+        low = cur_lab[..., 0].copy()
+        high = desired_l.copy()
+        for _ in range(7):
+            mid = (low + high) * 0.5
+            _, probe_error = render(mid)
+            acceptable = probe_error <= 1
+            low = np.where(acceptable, mid, low)
+            high = np.where(acceptable, high, mid)
+        bounded_l = np.where(needs_gamut_bound, low, desired_l)
+        out, _ = render(bounded_l)
     # Exact preservation inside windows and fixture cores; the surrounding
     # gain has already been feathered to zero by the exclusion field.
     core = exclusion_core > 0.95
