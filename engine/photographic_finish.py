@@ -53,8 +53,14 @@ def apply_lightroom_look(rgb: np.ndarray, scene: Scene) -> tuple[np.ndarray, dic
     # Guided bases retain strong edges. Fine and broad residuals approximate a
     # restrained Texture/Clarity finish without sharpening or halo-producing
     # unsharp masks.
-    fine_base = cv2.ximgproc.guidedFilter(y, y, radius=5, eps=5e-5)
-    broad_base = cv2.ximgproc.guidedFilter(y, y, radius=18, eps=1.5e-3)
+    fine_base = cv2.GaussianBlur(y, (0, 0), 1.1)
+    scale_down = max(1, int(np.ceil(max(shape) / 1800.0)))
+    if scale_down > 1:
+        small = cv2.resize(y, (shape[1] // scale_down, shape[0] // scale_down), interpolation=cv2.INTER_AREA)
+        small_base = cv2.ximgproc.guidedFilter(small, small, radius=8, eps=1.5e-3)
+        broad_base = cv2.resize(small_base, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+    else:
+        broad_base = cv2.ximgproc.guidedFilter(y, y, radius=18, eps=1.5e-3)
     fine_detail = y - fine_base
     broad_detail = fine_base - broad_base
     detail_delta = material * (0.10 * fine_detail + 0.045 * broad_detail)

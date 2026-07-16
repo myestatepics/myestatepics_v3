@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import time
 from types import MappingProxyType
 from typing import Callable
 
@@ -28,6 +29,7 @@ from engine.hdr_pipeline import (
     render_neutral_display,
 )
 from engine.photographic_finish import apply_lightroom_look
+from engine.window_recovery import recover_windows
 from engine.segmentation import SceneSegmenter
 from tools.hdr_a_validation import _segment
 
@@ -82,6 +84,7 @@ def _render_one(
     debug_stages: bool,
     segmenter: SceneSegmenter | None,
 ) -> dict:
+    started = time.perf_counter()
     master = _master_from_dng(source)
     neutral = render_neutral_display(master)
     if segmenter is None:
@@ -89,13 +92,16 @@ def _render_one(
     scene, segmentation_log = _segment(neutral.rgb, segmenter)
     measurements = measure_hdr_b1_scene(master, scene)
     rendered = render_hdr_c_global(master, measurements)
-    final_rgb, finish_log = apply_lightroom_look(rendered.rgb, scene)
+    finished_rgb, finish_log = apply_lightroom_look(rendered.rgb, scene)
+    final_rgb, window_log = recover_windows(
+        master.linear_srgb, finished_rgb, scene, seed=source.name,
+    )
 
     output_path = output_dir / f"{source.stem}.jpg"
     export = save_jpeg(
         _u8(final_rgb),
         output_path,
-        max_mb=2.5,
+        max_mb=2.0,
         start_quality=92,
         min_quality=82,
         expected_shape=master.linear_srgb.shape[:2],
@@ -104,7 +110,8 @@ def _render_one(
         debug_dir = output_dir / "debug" / source.stem
         _save_debug_stage(neutral.rgb, debug_dir / "01_neutral_display_16bit.png")
         _save_debug_stage(rendered.rgb, debug_dir / "02_hdr_c_final_16bit.png")
-        _save_debug_stage(final_rgb, debug_dir / "03_lightroom_look_16bit.png")
+        _save_debug_stage(finished_rgb, debug_dir / "03_lightroom_look_16bit.png")
+        _save_debug_stage(final_rgb, debug_dir / "04_window_recovery_16bit.png")
         (debug_dir / "render_log.json").write_text(
             json.dumps(
                 {
@@ -114,6 +121,7 @@ def _render_one(
                     "segmentation": segmentation_log,
                     "renderer": dict(rendered.log),
                     "photographic_finish": finish_log,
+                    "window_recovery": window_log,
                     "export": export,
                 },
                 indent=2,
@@ -129,9 +137,13 @@ def _render_one(
         "measurements": hdr_b1_measurements_to_dict(measurements),
         "renderer": dict(rendered.log),
         "photographic_finish": finish_log,
+        "window_recovery": window_log,
         "export": export,
+        "processing_seconds": float(time.perf_counter() - started),
+        "warnings": [],
+        "fallback_route": window_log["fallback_route"],
     }
-    del master, neutral, scene, measurements, rendered, final_rgb
+    del master, neutral, scene, measurements, rendered, finished_rgb, final_rgb
     gc.collect()
     return record
 
@@ -187,7 +199,7 @@ def process_batch(
     contact_path = output_dir / "batch_contact_sheet.jpg"
     _make_contact_sheet(successes, contact_path)
     summary = {
-        "pipeline": "approved_hdr_c_scene_linear_global_renderer",
+        "pipeline": "myestatepics_v5_scene_linear_mls_with_window_recovery",
         "input_folder": str(input_dir.resolve()),
         "output_folder": str(output_dir.resolve()),
         "total_count": len(sources),
@@ -198,9 +210,22 @@ def process_batch(
         "contact_sheet": str(contact_path),
         "debug_stages": bool(debug_stages),
     }
+    summary["quality_distribution"] = {
+        str(quality): sum(1 for item in successes if item.get("export", {}).get("quality") == quality)
+        for quality in sorted({item.get("export", {}).get("quality") for item in successes if item.get("export")})
+    }
+    summary["total_processing_seconds"] = float(sum(item.get("processing_seconds", 0.0) for item in successes))
+    summary["mean_processing_seconds"] = float(
+        summary["total_processing_seconds"] / max(len(successes), 1)
+    )
+    summary["total_output_mb"] = float(sum(item.get("export", {}).get("size_mb", 0.0) for item in successes))
     summary_json = json.dumps(summary, indent=2)
     (output_dir / "batch_summary.json").write_text(summary_json)
     (output_dir / "summary.json").write_text(summary_json)
+    (output_dir / "failure_report.json").write_text(json.dumps(failures, indent=2))
+    (output_dir / "file_size_report.json").write_text(json.dumps([
+        {"source_filename": item["source_filename"], **item.get("export", {})} for item in successes
+    ], indent=2))
     print(
         f"Complete: {len(successes)}/{len(sources)} succeeded, {len(failures)} failed. "
         f"Summary: {output_dir / 'batch_summary.json'}",

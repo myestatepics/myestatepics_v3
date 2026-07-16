@@ -108,7 +108,12 @@ def _linear_to_extended_srgb(linear: np.ndarray) -> np.ndarray:
 
 
 def _percentiles(array: np.ndarray) -> dict[str, float]:
-    values = np.asarray(array, dtype=np.float32)
+    values = np.asarray(array, dtype=np.float32).reshape(-1)
+    # Metadata statistics must not dominate production runtime or allocate a
+    # second full-resolution RGB plane. Deterministic striding preserves the
+    # distribution while bounding percentile work to one million samples.
+    if values.size > 1_000_000:
+        values = values[:: int(np.ceil(values.size / 1_000_000))]
     return {
         f"p{label}": float(value)
         for label, value in zip(
